@@ -55,7 +55,6 @@
 #include "Panzer_STKConnManager.hpp"
 
 #include "Intrepid2_HGRAD_HEX_C1_FEM.hpp"
-#include "Intrepid2_HGRAD_HEX_C2_FEM.hpp"
 
 typedef Kokkos::DynRankView<double,PHX::Device> FieldContainer;
 

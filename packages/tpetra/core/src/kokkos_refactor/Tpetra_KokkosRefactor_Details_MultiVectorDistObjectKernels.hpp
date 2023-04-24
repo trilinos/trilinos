@@ -61,6 +61,8 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "Tpetra_Details_debug_cwp.hpp"
+
 namespace Tpetra {
 namespace KokkosRefactor {
 namespace Details {
@@ -148,12 +150,13 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
     pack (const DstView& dst,
           const SrcView& src,
           const IdxView& idx,
-          const size_t col)
+          const size_t col,
+          const execution_space &space)
     {
       typedef Kokkos::RangePolicy<execution_space, size_type> range_type;
       Kokkos::parallel_for
         ("Tpetra::MultiVector pack one col",
-         range_type (0, idx.size ()),
+         range_type (space, 0, idx.size()),
          PackArraySingleColumn (dst, src, idx, col));
     }
   };
@@ -180,6 +183,7 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
     static_assert (std::is_integral<SizeType>::value,
                    "SizeType must be a built-in integer type.");
   public:
+    typedef typename DstView::execution_space execution_space;
     typedef SizeType size_type;
     using value_type = size_t;
 
@@ -200,44 +204,42 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
     operator() (const size_type k, value_type& lclErrCount) const {
       using index_type = typename IdxView::non_const_value_type;
 
+      
+      if (k >= static_cast<size_type> (idx.extent (0))) {
+        ++lclErrCount;
+        return;
+      }
+      if (k >= static_cast<size_type> (dst.extent(0))) {
+        ++lclErrCount;
+        return;
+      }
       const index_type lclRow = idx(k);
       if (lclRow < static_cast<index_type> (0) ||
-          lclRow >= static_cast<index_type> (src.extent (0))) {
+          lclRow >= static_cast<index_type> (src.extent (0)) || 
+          col >= static_cast<size_type> (src.extent (1))) {
         ++lclErrCount;
+        return;
       }
-      else {
-        dst(k) = src(lclRow, col);
-      }
-    }
-
-    KOKKOS_INLINE_FUNCTION
-    void init (value_type& initialErrorCount) const {
-      initialErrorCount = 0;
-    }
-
-    KOKKOS_INLINE_FUNCTION void
-    join (value_type& dstErrorCount,
-          const value_type& srcErrorCount) const
-    {
-      dstErrorCount += srcErrorCount;
+      dst(k) = src(lclRow, col);
     }
 
     static void
     pack (const DstView& dst,
           const SrcView& src,
           const IdxView& idx,
-          const size_type col)
+          const size_type col,
+          const execution_space &space)
     {
-      typedef typename DstView::execution_space execution_space;
-      typedef Kokkos::RangePolicy<execution_space, size_type> range_type;
-      typedef typename IdxView::non_const_value_type index_type;
+      using execution_space = typename DstView::execution_space;
+      using range_type = Kokkos::RangePolicy<execution_space, size_type>;
+      using index_type = typename IdxView::non_const_value_type;
 
-      size_t errorCount = 0;
+      size_t errorCount;
       Kokkos::parallel_reduce
         ("Tpetra::MultiVector pack one col debug only",
-         range_type (0, idx.size ()),
+         range_type (space, 0, idx.size ()),
          PackArraySingleColumnWithBoundsCheck (dst, src, idx, col),
-         errorCount);
+         Kokkos::Sum<size_t>(errorCount));
 
       if (errorCount != 0) {
         // Go back and find the out-of-bounds entries in the index
@@ -286,8 +288,11 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
                             const SrcView& src,
                             const IdxView& idx,
                             const size_t col,
-                            const bool debug = true)
+                            const bool debug,
+                            const typename DstView::execution_space &space)
   {
+    using execution_space = typename DstView::execution_space;
+
     static_assert (Kokkos::is_view<DstView>::value,
                    "DstView must be a Kokkos::View.");
     static_assert (Kokkos::is_view<SrcView>::value,
@@ -301,14 +306,46 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
     static_assert (static_cast<int> (IdxView::rank) == 1,
                    "IdxView must be a rank-1 Kokkos::View.");
 
+    static_assert (Kokkos::SpaceAccessibility<execution_space,
+                     typename DstView::memory_space>::accessible,
+                   "DstView not accessible");
+    static_assert (Kokkos::SpaceAccessibility<execution_space,
+                     typename SrcView::memory_space>::accessible,
+                   "SrcView not accessible");
+    static_assert (Kokkos::SpaceAccessibility<execution_space,
+                     typename IdxView::memory_space>::accessible,
+                   "IdxView not accessible");
+
+    // std::cerr << __FILE__ << ":" << __LINE__ << " "
+    //           << " pack_array_single_column"
+    //           << " " << dst.size()
+    //           << " " << src.size()
+    //           << " " << idx.size()
+    //           << "\n";
+
     if (debug) {
-      typedef PackArraySingleColumnWithBoundsCheck<DstView,SrcView,IdxView> impl_type;
-      impl_type::pack (dst, src, idx, col);
+      // std::cerr << __FILE__ << ":" << __LINE__ << ": pack_array_single_column debug\n";
+      using impl_type = PackArraySingleColumnWithBoundsCheck<DstView,SrcView,IdxView>;
+      impl_type::pack (dst, src, idx, col, space);
+      // std::cerr << __FILE__ << ":" << __LINE__ << ": pack_array_single_column debug done\n";
     }
     else {
-      typedef PackArraySingleColumn<DstView,SrcView,IdxView> impl_type;
-      impl_type::pack (dst, src, idx, col);
+      using impl_type = PackArraySingleColumn<DstView, SrcView, IdxView>;
+      impl_type::pack (dst, src, idx, col, space);
     }
+  }
+
+  /*! \brief pack_array_single_column in the default execution space
+  */
+  template <typename DstView, typename SrcView, typename IdxView>
+  void
+  pack_array_single_column (const DstView& dst,
+                            const SrcView& src,
+                            const IdxView& idx,
+                            const size_t col,
+                            const bool debug = true)
+  {
+    pack_array_single_column(dst, src, idx, col, debug, typename DstView::execution_space());
   }
 
   template <typename DstView, typename SrcView, typename IdxView,
@@ -340,11 +377,12 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
     static void pack(const DstView& dst,
                      const SrcView& src,
                      const IdxView& idx,
-                     size_t numCols) {
+                     size_t numCols,
+                     const execution_space &space) {
       typedef Kokkos::RangePolicy<execution_space, size_type> range_type;
       Kokkos::parallel_for
         ("Tpetra::MultiVector pack multicol const stride",
-         range_type (0, idx.size ()),
+         range_type (space, 0, idx.size ()),
          PackArrayMultiColumn (dst, src, idx, numCols));
     }
   };
@@ -356,6 +394,7 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
             typename Enabled = void>
   class PackArrayMultiColumnWithBoundsCheck {
   public:
+    using execution_space = typename DstView::execution_space;
     using size_type = SizeType;
     using value_type = size_t;
 
@@ -405,7 +444,8 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
     pack (const DstView& dst,
           const SrcView& src,
           const IdxView& idx,
-          const size_type numCols)
+          const size_type numCols,
+          const execution_space &space)
     {
       typedef typename DstView::execution_space execution_space;
       typedef Kokkos::RangePolicy<execution_space, size_type> range_type;
@@ -414,7 +454,7 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
       size_t errorCount = 0;
       Kokkos::parallel_reduce
         ("Tpetra::MultiVector pack multicol const stride debug only",
-         range_type (0, idx.size ()),
+         range_type (space, 0, idx.size ()),
          PackArrayMultiColumnWithBoundsCheck (dst, src, idx, numCols),
          errorCount);
       if (errorCount != 0) {
@@ -457,7 +497,6 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
     }
   };
 
-
   template <typename DstView,
             typename SrcView,
             typename IdxView>
@@ -466,7 +505,8 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
                            const SrcView& src,
                            const IdxView& idx,
                            const size_t numCols,
-                           const bool debug = true)
+                           const bool debug,
+                           const typename DstView::execution_space &space)
   {
     static_assert (Kokkos::is_view<DstView>::value,
                    "DstView must be a Kokkos::View.");
@@ -481,16 +521,33 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
     static_assert (static_cast<int> (IdxView::rank) == 1,
                    "IdxView must be a rank-1 Kokkos::View.");
 
+    CWP_CERR(__FILE__ << ":" << __LINE__ << ": pack_array_multi_column\n");
+
     if (debug) {
       typedef PackArrayMultiColumnWithBoundsCheck<DstView,
         SrcView, IdxView> impl_type;
-      impl_type::pack (dst, src, idx, numCols);
+      impl_type::pack (dst, src, idx, numCols, space);
     }
     else {
       typedef PackArrayMultiColumn<DstView, SrcView, IdxView> impl_type;
-      impl_type::pack (dst, src, idx, numCols);
+      impl_type::pack (dst, src, idx, numCols, space);
     }
   }
+
+  template <typename DstView,
+            typename SrcView,
+            typename IdxView>
+  void
+  pack_array_multi_column (const DstView& dst,
+                           const SrcView& src,
+                           const IdxView& idx,
+                           const size_t numCols,
+                           const bool debug = true)
+  {
+    pack_array_multi_column(dst, src, idx, numCols, debug, typename DstView::execution_space());
+  }
+
+
 
   template <typename DstView, typename SrcView, typename IdxView,
             typename ColView, typename Enabled = void>
@@ -524,11 +581,12 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
                      const SrcView& src,
                      const IdxView& idx,
                      const ColView& col,
-                     size_t numCols) {
+                     size_t numCols,
+                     const execution_space &space) {
       typedef Kokkos::RangePolicy<execution_space, size_type> range_type;
       Kokkos::parallel_for
         ("Tpetra::MultiVector pack multicol var stride",
-         range_type (0, idx.size ()),
+         range_type (space, 0, idx.size ()),
          PackArrayMultiColumnVariableStride (dst, src, idx, col, numCols));
     }
   };
@@ -541,6 +599,7 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
             typename Enabled = void>
   class PackArrayMultiColumnVariableStrideWithBoundsCheck {
   public:
+    using execution_space = typename DstView::execution_space;
     using size_type = SizeType;
     using value_type = size_t;
 
@@ -600,7 +659,8 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
           const SrcView& src,
           const IdxView& idx,
           const ColView& col,
-          const size_type numCols)
+          const size_type numCols,
+          const execution_space &space)
     {
       using execution_space = typename DstView::execution_space;
       using range_type = Kokkos::RangePolicy<execution_space, size_type>;
@@ -610,7 +670,7 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
       size_t errorCount = 0;
       Kokkos::parallel_reduce
         ("Tpetra::MultiVector pack multicol var stride debug only",
-         range_type (0, idx.size ()),
+         range_type (space, 0, idx.size ()),
          PackArrayMultiColumnVariableStrideWithBoundsCheck (dst, src, idx,
                                                             col, numCols),
          errorCount);
@@ -717,7 +777,8 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
                                            const IdxView& idx,
                                            const ColView& col,
                                            const size_t numCols,
-                                           const bool debug = true)
+                                           const bool debug,
+                                           const typename DstView::execution_space &space)
   {
     static_assert (Kokkos::is_view<DstView>::value,
                    "DstView must be a Kokkos::View.");
@@ -736,16 +797,33 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
     static_assert (static_cast<int> (ColView::rank) == 1,
                    "ColView must be a rank-1 Kokkos::View.");
 
+    CWP_CERR(__FILE__ << ":" << __LINE__ << ": pack_array_multi_column_variable_stride\n");
+
     if (debug) {
       typedef PackArrayMultiColumnVariableStrideWithBoundsCheck<DstView,
         SrcView, IdxView, ColView> impl_type;
-      impl_type::pack (dst, src, idx, col, numCols);
+      impl_type::pack (dst, src, idx, col, numCols, space);
     }
     else {
       typedef PackArrayMultiColumnVariableStride<DstView,
         SrcView, IdxView, ColView> impl_type;
-      impl_type::pack (dst, src, idx, col, numCols);
+      impl_type::pack (dst, src, idx, col, numCols, space);
     }
+  }
+
+  template <typename DstView,
+            typename SrcView,
+            typename IdxView,
+            typename ColView>
+  void
+  pack_array_multi_column_variable_stride (const DstView& dst,
+                                           const SrcView& src,
+                                           const IdxView& idx,
+                                           const ColView& col,
+                                           const size_t numCols,
+                                           const bool debug = true)
+  {
+    pack_array_multi_column_variable_stride(dst, src, idx, col, numCols, debug, typename DstView::execution_space());
   }
 
   // Tag types to indicate whether to use atomic updates in the
@@ -852,8 +930,7 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
     size_t numCols;
 
   public:
-    UnpackArrayMultiColumn (const ExecutionSpace& /* execSpace */,
-                            const DstView& dst_,
+    UnpackArrayMultiColumn (const DstView& dst_,
                             const SrcView& src_,
                             const IdxView& idx_,
                             const Op& op_,
@@ -895,16 +972,16 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
           Kokkos::RangePolicy<atomic_tag, execution_space, size_type>;
         Kokkos::parallel_for
           ("Tpetra::MultiVector unpack const stride atomic",
-           range_type (0, idx.size ()),
-           UnpackArrayMultiColumn (execSpace, dst, src, idx, op, numCols));
+           range_type (execSpace, 0, idx.size ()),
+           UnpackArrayMultiColumn (dst, src, idx, op, numCols));
       }
       else {
         using range_type =
           Kokkos::RangePolicy<nonatomic_tag, execution_space, size_type>;
         Kokkos::parallel_for
           ("Tpetra::MultiVector unpack const stride nonatomic",
-           range_type (0, idx.size ()),
-           UnpackArrayMultiColumn (execSpace, dst, src, idx, op, numCols));
+           range_type (execSpace, 0, idx.size ()),
+           UnpackArrayMultiColumn (dst, src, idx, op, numCols));
       }
     }
   };
@@ -946,8 +1023,7 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
     size_type numCols;
 
   public:
-    UnpackArrayMultiColumnWithBoundsCheck (const ExecutionSpace& /* execSpace */,
-                                           const DstView& dst_,
+    UnpackArrayMultiColumnWithBoundsCheck (const DstView& dst_,
                                            const SrcView& src_,
                                            const IdxView& idx_,
                                            const Op& op_,
@@ -1016,9 +1092,8 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
           Kokkos::RangePolicy<atomic_tag, execution_space, size_type>;
         Kokkos::parallel_reduce
           ("Tpetra::MultiVector unpack multicol const stride atomic debug only",
-           range_type (0, idx.size ()),
-           UnpackArrayMultiColumnWithBoundsCheck (execSpace, dst, src,
-                                                  idx, op, numCols),
+           range_type (execSpace, 0, idx.size ()),
+           UnpackArrayMultiColumnWithBoundsCheck (dst, src, idx, op, numCols),
            errorCount);
       }
       else {
@@ -1026,9 +1101,8 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
           Kokkos::RangePolicy<nonatomic_tag, execution_space, size_type>;
         Kokkos::parallel_reduce
           ("Tpetra::MultiVector unpack multicol const stride nonatomic debug only",
-           range_type (0, idx.size ()),
-           UnpackArrayMultiColumnWithBoundsCheck (execSpace, dst, src,
-                                                  idx, op, numCols),
+           range_type (execSpace, 0, idx.size ()),
+           UnpackArrayMultiColumnWithBoundsCheck (dst, src, idx, op, numCols),
            errorCount);
       }
 
@@ -1155,8 +1229,7 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
     size_t numCols;
 
   public:
-    UnpackArrayMultiColumnVariableStride (const ExecutionSpace& /* execSpace */,
-                                          const DstView& dst_,
+    UnpackArrayMultiColumnVariableStride (const DstView& dst_,
                                           const SrcView& src_,
                                           const IdxView& idx_,
                                           const ColView& col_,
@@ -1201,8 +1274,8 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
           Kokkos::RangePolicy<atomic_tag, execution_space, size_type>;
         Kokkos::parallel_for
           ("Tpetra::MultiVector unpack var stride atomic",
-           range_type (0, idx.size ()),
-           UnpackArrayMultiColumnVariableStride (execSpace, dst, src,
+           range_type (execSpace, 0, idx.size ()),
+           UnpackArrayMultiColumnVariableStride (dst, src,
                                                  idx, col, op, numCols));
       }
       else {
@@ -1210,8 +1283,8 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
           Kokkos::RangePolicy<nonatomic_tag, execution_space, size_type>;
         Kokkos::parallel_for
           ("Tpetra::MultiVector unpack var stride nonatomic",
-           range_type (0, idx.size ()),
-           UnpackArrayMultiColumnVariableStride (execSpace, dst, src,
+           range_type (execSpace, 0, idx.size ()),
+           UnpackArrayMultiColumnVariableStride (dst, src,
                                                  idx, col, op, numCols));
       }
     }
@@ -1484,7 +1557,10 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
     static_assert (static_cast<int> (ColView::rank) == 1,
                    "ColView must be a rank-1 Kokkos::View.");
 
+    CWP_CERR(__FILE__ << ":" << __LINE__ << ": unpack_array_multi_column_variable_stride\n");
+
     if (debug) {
+      CWP_CERR(__FILE__ << ":" << __LINE__ << ": unpack_array_multi_column_variable_stride (DEBUG)\n");
       using impl_type =
         UnpackArrayMultiColumnVariableStrideWithBoundsCheck<ExecutionSpace,
           DstView, SrcView, IdxView, ColView, Op>;
@@ -1492,6 +1568,7 @@ outOfBounds (const IntegerType x, const IntegerType exclusiveUpperBound)
                          use_atomic_updates);
     }
     else {
+      CWP_CERR(__FILE__ << ":" << __LINE__ << ": unpack_array_multi_column_variable_stride (NO DEBUG)\n");
       using impl_type = UnpackArrayMultiColumnVariableStride<ExecutionSpace,
         DstView, SrcView, IdxView, ColView, Op>;
       impl_type::unpack (execSpace, dst, src, idx, col, op, numCols,

@@ -71,6 +71,8 @@
 #include <utility>
 #include <vector>
 
+#include "Tpetra_Details_debug_cwp.hpp"
+
 namespace Tpetra {
   namespace Details {
     namespace Impl {
@@ -6436,7 +6438,8 @@ namespace Tpetra {
   template <class LocalOrdinal, class GlobalOrdinal, class Node>
   void
   CrsGraph<LocalOrdinal, GlobalOrdinal, Node>::
-  getLocalOffRankOffsets (offset_device_view_type& offsets) const
+  getLocalOffRankOffsets (offset_device_view_type& offsets,
+                          const execution_space &space) const
   {
     using std::endl;
     const char tfecfFuncName[] = "getLocalOffRankOffsets: ";
@@ -6453,6 +6456,10 @@ namespace Tpetra {
 
     TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
       (! hasColMap (), std::runtime_error, "The graph must have a column Map.");
+    if (! hasColMap ()) {
+      CWP_CERR(__FILE__ << ":" << __LINE__ << " the graph must have a column map!\n");
+      exit(1);
+    }
     // Instead of throwing, we could also copy the rowPtr to k_offRankOffsets_.
 
     const size_t lclNumRows = this->getLocalNumRows ();
@@ -6482,8 +6489,11 @@ namespace Tpetra {
       auto lclGraph = this->getLocalGraphDevice ();
       ::Tpetra::Details::getGraphOffRankOffsets (k_offRankOffsets_,
                                                  lclColMap, lclDomMap,
-                                                 lclGraph);
+                                                 lclGraph, space);
       haveLocalOffRankOffsets_ = true;
+    } else {
+      CWP_CERR(__FILE__ << ":" << __LINE__ << " graph is not fill-complete!\n");
+      exit(1);      
     }
   }
 

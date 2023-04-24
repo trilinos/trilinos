@@ -42,7 +42,12 @@
 
 #include "Tpetra_LocalCrsMatrixOperator_fwd.hpp"
 #include "Tpetra_LocalOperator.hpp"
+#include "Tpetra_Details_Spaces.hpp"
 #include "KokkosSparse_CrsMatrix.hpp"
+#include "KokkosKernels_ExecSpaceUtils.hpp"
+#include "Tpetra_Core.hpp"
+#include "Tpetra_Details_spmv.hpp"
+
 #include <memory> // std::shared_ptr
 
 namespace Tpetra {
@@ -89,6 +94,7 @@ namespace Tpetra {
     using local_graph_device_type = typename local_matrix_device_type::StaticCrsGraphType;
 
   public:
+  
     using ordinal_view_type = typename local_graph_device_type::entries_type::non_const_type;
 
     LocalCrsMatrixOperator (const std::shared_ptr<local_matrix_device_type>& A);
@@ -113,6 +119,60 @@ namespace Tpetra {
            const Teuchos::ETransp mode,
            const mv_scalar_type alpha,
            const mv_scalar_type beta) const;
+
+    /*! \brief
+        \c apply() but only contribute entries specified in offRankOffsets,
+        which should be populated by \c CrsGraph::getLocalOffRankOffsets.
+        Complement of \c applyLocalColumns
+
+        \tparam OffsetDeviceViewType should be the CrsMatrix::crs_graph_type::offset_device_view_type of the \c Tpetra::CrsMatrix that owns this LocalCrsMatrixOperator
+    
+        cwp 05 Apr 2022
+        applyRemoteColumns() with applyLocalColumns() shall have the same effect as apply()
+    */ 
+    template<typename OffsetDeviceViewType>
+    void
+    applyRemoteColumns (const execution_space &execSpace,
+           Kokkos::View<const mv_scalar_type**, array_layout,
+             device_type, Kokkos::MemoryTraits<Kokkos::Unmanaged> > X,
+           Kokkos::View<mv_scalar_type**, array_layout,
+             device_type, Kokkos::MemoryTraits<Kokkos::Unmanaged> > Y,
+           const Teuchos::ETransp mode,
+           const mv_scalar_type alpha,
+           const mv_scalar_type beta,
+           const OffsetDeviceViewType &offRankOffsets) const {
+
+      using RowViewer = Tpetra::Details::OffRankRowViewer<local_matrix_device_type, OffsetDeviceViewType>;
+
+      Tpetra::Details::spmv<RowViewer>(execSpace, alpha, *A_, X, beta, Y, mode, offRankOffsets);
+    }
+
+    /*! \brief
+        Complement of \c applyRemoteColumns(). Only contribute matrix entries NOT specified in offRankOffsets,
+        which should be populated by \c CrsGraph::getLocalOffRankOffsets
+
+        \tparam OffsetDeviceViewType should be the CrsMatrix::crs_graph_type::offset_device_view_type of the \c Tpetra::CrsMatrix that owns this LocalCrsMatrixOperator
+    
+        cwp 05 Apr 2022
+        applyRemoteColumns() with applyLocalColumns() shall have the same effect as apply()
+    */ 
+    template<typename OffsetDeviceViewType>
+    void
+    applyLocalColumns (const execution_space &execSpace,
+           Kokkos::View<const mv_scalar_type**, array_layout,
+             device_type, Kokkos::MemoryTraits<Kokkos::Unmanaged> > X,
+           Kokkos::View<mv_scalar_type**, array_layout,
+             device_type, Kokkos::MemoryTraits<Kokkos::Unmanaged> > Y,
+           const Teuchos::ETransp mode,
+           const mv_scalar_type alpha,
+           const mv_scalar_type beta,
+           const OffsetDeviceViewType &offRankOffsets) const {
+      using RowViewer = Tpetra::Details::OnRankRowViewer<local_matrix_device_type, OffsetDeviceViewType>;
+      Tpetra::Details::spmv<RowViewer>(execSpace, alpha, *A_, X, beta, Y, mode, offRankOffsets);
+    }
+
+
+           
 
     bool hasTransposeApply () const override;
 

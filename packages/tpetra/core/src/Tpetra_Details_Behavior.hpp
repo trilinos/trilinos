@@ -269,12 +269,28 @@ public:
   /// <tt>TPETRA_SKIP_COPY_AND_PERMUTE</tt> environment variable.
   static bool skipCopyAndPermuteIfPossible();
 
-  /// \brief Overlap communication and computation.
+  /// \brief Overlap communication and computation in residual
   ///
   /// This is disabled by default.  You may control this at run time via the
   /// <tt>TPETRA_OVERLAP</tt> environment variable.
+
   static bool overlapCommunicationAndComputation();
 
+  /// \brief Overlap communication and computation in SpMV
+  ///
+  /// This is disabled by default.  You may control this at run time via the
+  /// <tt>TPETRA_OVERLAP_SPMV</tt> environment variable.
+  ///
+  /// Merging this with overlapCommunicationAndComputation causes
+  /// certain tests to fail, as the residual is designed to overlap
+  /// correctly only in certain circumstances
+  static bool overlapSpmvCommunicationAndComputation();
+
+  /// \brief Warn if more than this many Kokkos spaces are accessed.
+  ///
+  /// This is disabled by default.  You may control this at run time via the
+  /// <tt>TPETRA_SPACE_ID_WARN_LIMIT</tt> environment variable.
+  static size_t spacesIdWarnLimit();
 
   /// \brief Add Teuchos timers for all host calls to Kokkos::deep_copy().
   /// This is especially useful for identifying host/device data transfers

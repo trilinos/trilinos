@@ -53,6 +53,7 @@
 #include "Tpetra_RowMatrix.hpp"
 #include "Tpetra_LocalCrsMatrixOperator.hpp"
 
+#include "Tpetra_Details_Spaces.hpp"
 #include "Tpetra_Details_Behavior.hpp"
 #include "Tpetra_Details_castAwayConstDualView.hpp"
 #include "Tpetra_Details_computeOffsets.hpp"
@@ -82,6 +83,8 @@
 #include <typeinfo>
 #include <utility>
 #include <vector>
+
+#include "Tpetra_Details_nvtx.hpp"
 
 namespace Tpetra {
 
@@ -4693,23 +4696,198 @@ CrsMatrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>::
   template <class Scalar, class LocalOrdinal, class GlobalOrdinal, class Node>
   void
   CrsMatrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>::
-  applyNonTranspose (const MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node> & X_in,
+  applyNonTransposeOverlapped (const MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node> & X_in,
                      MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node> & Y_in,
                      Scalar alpha,
-                     Scalar beta) const
-  {
+                     Scalar beta) const {
+    CWP_CERR(__FILE__<<":"<<__LINE__<<" applyNonTranposeOverlapped()\n");
+    Tpetra::Details::Range range("applyNonTransposeOverlapped");
     using Tpetra::Details::ProfilingRegion;
     using Teuchos::RCP;
     using Teuchos::rcp;
     using Teuchos::rcp_const_cast;
     using Teuchos::rcpFromRef;
     const Scalar ZERO = Teuchos::ScalarTraits<Scalar>::zero ();
-    const Scalar ONE = Teuchos::ScalarTraits<Scalar>::one ();
+    // const Scalar ONE = Teuchos::ScalarTraits<Scalar>::one ();
+    typedef typename Node::execution_space exec_space;
 
-    // mfh 05 Jun 2014: Special case for alpha == 0.  I added this to
-    // fix an Ifpack2 test (RILUKSingleProcessUnitTests), which was
-    // failing only for the Kokkos refactor version of Tpetra.  It's a
-    // good idea regardless to have the bypass.
+    exec_space defaultSpace;
+    Teuchos::RCP<const exec_space> onRankSpace = 
+      space_instance<exec_space, Tpetra::Details::Spaces::Priority::low>();
+    Teuchos::RCP<const exec_space> offRankSpace = 
+      space_instance<exec_space, Tpetra::Details::Spaces::Priority::high>();
+
+    RCP<const import_type> importer = this->getGraph ()->getImporter ();
+    RCP<const export_type> exporter = this->getGraph ()->getExporter ();
+    const bool mustImport = !importer.is_null();
+    const bool mustExport = !exporter.is_null();
+
+    // If beta == 0, then the output MV will be overwritten; none of
+    // its entries should be read.  (Sparse BLAS semantics say that we
+    // must ignore any Inf or NaN entries in Y_in, if beta is zero.)
+    // This matters if we need to do an Export operation; see below.
+    const bool yIsOverwritten = (beta == ZERO);
+
+    // We treat the case of a replicated MV output specially.
+    // An all-reduce at the end will sum results, so only contribute
+    // replicated y input entries from one rank
+    const bool yIsReplicated =
+      (! Y_in.isDistributed () && this->getComm ()->getSize () != 1);
+    if (yIsReplicated && this->getComm ()->getRank () > 0) {
+      beta = ZERO;
+    }
+
+    // cwp Apr 14, 2022, mfh 05 Jun 2014
+    // FIXME: x and y may still alias if this is false, we'll just incorrectly handle that case
+    bool xyDefinitelyAlias;
+
+    // Temporary MV for Import operation and off-rank SpMV
+    RCP<const MV> X_colMap;
+    RCP<MV> X_colMapNonConst;
+
+    CWP_CERR(__FILE__<<":"<<__LINE__<<"\n");
+    if (!mustImport) {
+      ProfilingRegion region("Tpetra::CrsMatrix::applyNonTransposeOverlapped: X");
+      if (! X_in.isConstantStride ()) {
+        // use a constant-stride version of X_in
+        // avoid reproducing if possible
+        X_colMapNonConst = getColumnMapMultiVector (X_in, true);
+        Tpetra::deep_copy (*X_colMapNonConst, X_in);
+        X_colMap = rcp_const_cast<const MV> (X_colMapNonConst);
+      } else {
+        // no import is needed, so off-rank will operate on input as well
+        X_colMap = rcpFromRef (X_in);
+      }
+      xyDefinitelyAlias = X_colMap.getRawPtr () == &Y_in;
+    } else { // need to Import source (multi)vector
+      ProfilingRegion region("Tpetra::CrsMatrix::applyNonTransposeOverlapped: X");
+      X_colMapNonConst = getColumnMapMultiVector (X_in);
+      xyDefinitelyAlias = X_colMapNonConst.getRawPtr () == &Y_in;
+    }
+
+    // set up temporary output, to be used:
+    // 1) if export is needed
+    // 2) if x and y alias
+    // 3) if Y_in is non-constant stride
+    // FIXME cwp Oct 25 2022: I think we can skip this if export is not needed
+    RCP<MV> Y_rowMap = getRowMapMultiVector (Y_in);
+
+    CWP_CERR(__FILE__<<":"<<__LINE__<<"\n");
+    if (!mustExport) {
+      ProfilingRegion region("Tpetra::CrsMatrix::applyNonTransposeOverlapped: Y");
+      if (!Y_in.isConstantStride() || xyDefinitelyAlias) {
+        Y_rowMap = getRowMapMultiVector (Y_in, true);
+
+        // If beta == 0, Y_rowmap will be overwritten anyway
+        if (beta != ZERO) {
+          Tpetra::deep_copy (*Y_rowMap, Y_in);
+        }
+      }
+    }
+
+    // Incoming tpetra operations (we may depend on!) are in the default execution space instance
+    Details::Spaces::exec_space_wait("local SpMV waits previous op", defaultSpace, *onRankSpace);
+    if (mustExport) {
+      ProfilingRegion region("Tpetra::CrsMatrix::applyNonTransposeOverlapped: localApplyOnRank");
+      this->localApplyOnRank(*onRankSpace, X_in, *Y_rowMap, Teuchos::NO_TRANS, alpha, ZERO);
+    } else {
+      ProfilingRegion region("Tpetra::CrsMatrix::applyNonTransposeOverlapped: localApplyOnRank");
+      if (!Y_in.isConstantStride () || xyDefinitelyAlias) {
+        this->localApplyOnRank(*onRankSpace, X_in, *Y_rowMap, Teuchos::NO_TRANS, alpha, beta);
+      } else {
+        CWP_CERR(__FILE__<<":"<<__LINE__<<"\n");
+        this->localApplyOnRank(*onRankSpace, X_in, Y_in, Teuchos::NO_TRANS, alpha, beta);
+      }
+    } 
+
+    CWP_CERR(__FILE__<<":"<<__LINE__<<"\n");
+    // actually do the import if necessary
+    if (mustImport) {
+      // Import from the domain Map MV to the column Map MV.
+      ProfilingRegion("Tpetra::CrsMatrix::applyNonTransposeOverlapped: beginImport/endImport");
+      // make sure other incoming tpetra operations are done before import is started
+      Details::Spaces::exec_space_wait("import waits previous op", defaultSpace, *offRankSpace);
+      X_colMapNonConst->beginImport (X_in, *importer, INSERT, false/*restrictedMode*/, *offRankSpace);
+      X_colMapNonConst->endImport(X_in, *importer, INSERT, false/*restrictedMode*/, *offRankSpace);
+      X_colMap = rcp_const_cast<const MV> (X_colMapNonConst);
+    } 
+
+    CWP_CERR(__FILE__<<":"<<__LINE__<<"\n");
+    if (mustExport) {
+      ProfilingRegion region("Tpetra::CrsMatrix::applyNonTransposeOverlapped: localApplyOffRank");
+      Details::Spaces::exec_space_wait("export waits local SpMV", *onRankSpace, defaultSpace); // wait for local SpMV
+      Details::Spaces::exec_space_wait("export waits import", *offRankSpace, defaultSpace); // wait for import
+      this->localApplyOffRank(defaultSpace, *X_colMap, *Y_rowMap, Teuchos::NO_TRANS, alpha);
+      {
+        ProfilingRegion regionExport ("Tpetra::CrsMatrix::applyNonTransposeOverlapped: Export");
+
+        // If we're overwriting the output MV Y_in completely (beta ==
+        // 0), then make sure that it is filled with zeros before we
+        // do the Export.  Otherwise, the ADD combine mode will use
+        // data in Y_in, which is supposed to be zero.
+        if (yIsOverwritten) {
+          Y_in.putScalar (ZERO);
+        }
+        else {
+          // Scale output MV by beta, so that doExport sums in the
+          // mat-vec contribution: Y_in = beta*Y_in + alpha*A*X_in.
+          Y_in.scale (beta);
+        }
+        // Do the Export operation.
+        Y_in.doExport (*Y_rowMap, *exporter, ADD_ASSIGN);
+      }
+    } else {
+
+      if (!Y_in.isConstantStride () || xyDefinitelyAlias) {
+        ProfilingRegion region("Tpetra::CrsMatrix::applyNonTransposeOverlapped: localApplyOffRank");
+        Details::Spaces::exec_space_wait("off-rank waits on-rank SpMV", *onRankSpace, defaultSpace); // wait for local SpMV
+        Details::Spaces::exec_space_wait("off-rank waits import", *offRankSpace, defaultSpace); // wait for import
+        this->localApplyOffRank(defaultSpace, *X_colMap, *Y_rowMap, Teuchos::NO_TRANS, alpha);
+        Tpetra::deep_copy (Y_in, *Y_rowMap);
+      } else {
+        ProfilingRegion region("Tpetra::CrsMatrix::applyNonTransposeOverlapped: localApplyOffRank");
+        Details::Spaces::exec_space_wait("off-rank waits on-rank SpMV", *onRankSpace, defaultSpace); // wait for local SpMV
+        Details::Spaces::exec_space_wait("off-rank waits import", *offRankSpace, defaultSpace); // wait for import
+        this->localApplyOffRank(defaultSpace, *X_colMap, Y_in, Teuchos::NO_TRANS, alpha);
+      }
+    }
+
+    CWP_CERR(__FILE__<<":"<<__LINE__<<"\n");
+    // If the range Map is a locally replicated Map, sum up
+    // contributions from each process.  We set beta = 0 on all
+    // processes but Proc 0 initially, so this will handle the scaling
+    // factor beta correctly.
+    if (yIsReplicated) {
+      ProfilingRegion regionReduce ("Tpetra::CrsMatrix::applyNonTransposeOverlapped: Reduce Y");
+      Y_in.reduce ();
+    }
+    CWP_CERR(__FILE__<<":"<<__LINE__<<"applyNonTransposeOverlapped done\n");
+  }
+
+  template <class Scalar, class LocalOrdinal, class GlobalOrdinal, class Node>
+  void
+  CrsMatrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>::
+  applyNonTranspose (const MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node> & X_in,
+                     MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node> & Y_in,
+                     Scalar alpha,
+                     Scalar beta) const
+  {
+
+    using Tpetra::Details::ProfilingRegion;
+    using Teuchos::RCP;
+    using Teuchos::rcp;
+    using Teuchos::rcp_const_cast;
+    using Teuchos::rcpFromRef;
+
+    if (X_in.getNumVectors() != Y_in.getNumVectors()) {
+      std::stringstream ss;
+      ss << __FILE__ << ":" << __LINE__ << ": CrsMatrix::applyNonTranspose: x and y have different numbers of vectors!";
+      throw std::runtime_error(ss.str());
+    }
+
+    const Scalar ZERO = Teuchos::ScalarTraits<Scalar>::zero ();
+    const Scalar ONE = Teuchos::ScalarTraits<Scalar>::one ();
+    
     if (alpha == ZERO) {
       if (beta == ZERO) {
         Y_in.putScalar (ZERO);
@@ -4717,6 +4895,26 @@ CrsMatrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>::
         Y_in.scale (beta);
       }
       return;
+    }
+
+    bool overlap = Details::Behavior::overlapSpmvCommunicationAndComputation();
+
+    /* Overlap fails for Sacado::UQ::PCE for unknown reasons.
+       This also catches Kokkos::complex in for Kokkos < 4.0
+    */
+    overlap &= std::is_trivially_copyable<Scalar>::value;
+
+    // Graph must be sorted for the off-rank offsets to be meaningful
+    if (overlap && !getCrsGraph()->isSorted()) {
+      Tpetra::Details::mark("unsorted");
+      overlap = false;
+    }
+
+    // if domain map has no local entries, there's no on-rank data in
+    // X to overlap with
+    if (overlap && 0 == getDomainMap()->getLocalNumElements()) {
+      Tpetra::Details::mark("no local work");
+      overlap = false;
     }
 
     // It's possible that X is a view of Y or vice versa.  We don't
@@ -4729,6 +4927,35 @@ CrsMatrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>::
 
     RCP<const import_type> importer = this->getGraph ()->getImporter ();
     RCP<const export_type> exporter = this->getGraph ()->getExporter ();
+
+    // X_in is on the domain map. If the local part of the domain map does not match
+    // the column map, the ith entry of X_in does not correspond to column i of the matrix
+    // in local indices.
+    // on-rank part of SpMV would be wrong.
+    if (overlap) {
+#if 0
+      ProfilingRegion region("Tpetra::CrsMatrix::applyNonTranspose: colmap->isLocallyFitted(dommap)");
+      if (!getColMap()->isLocallyFitted(*getDomainMap())) {
+        overlap = false;
+      }
+#else
+      // importer's source map is domain map and target is column map
+      // this just checks if the number of same IDs in the column and domain map
+      // is the same of the smaller of the two maps
+      //TODO: we actually want to know if the local part of the domain map is not
+      // a subset of the colum map, are these the same things?
+      ProfilingRegion region("Tpetra::CrsMatrix::applyNonTranspose: importer->isLocallyFitted");
+      if (!importer.is_null() && !importer->isLocallyFitted()) {
+        Tpetra::Details::mark("not locally fitted");
+        overlap = false;
+      }
+#endif
+    }
+
+    if (overlap) {
+      applyNonTransposeOverlapped(X_in, Y_in, alpha, beta);
+      return;
+    }
 
     // If beta == 0, then the output MV will be overwritten; none of
     // its entries should be read.  (Sparse BLAS semantics say that we
@@ -4855,6 +5082,141 @@ CrsMatrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>::
       ProfilingRegion regionReduce ("Tpetra::CrsMatrix::apply: Reduce Y");
       Y_in.reduce ();
     }
+  }
+
+template <class Scalar, class LocalOrdinal, class GlobalOrdinal, class Node>
+  void
+  CrsMatrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>::
+  applyTransposeOverlapped (const MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node> & X_in,
+                     MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node> & Y_in,
+                     const Teuchos::ETransp &mode,
+                     Scalar alpha,
+                     Scalar beta) const {
+#if 0
+    using Tpetra::Details::ProfilingRegion;
+    using Teuchos::RCP;
+    using Teuchos::rcp;
+    using Teuchos::rcp_const_cast;
+    using Teuchos::rcpFromRef;
+    const Scalar ZERO = Teuchos::ScalarTraits<Scalar>::zero ();
+    const Scalar ONE = Teuchos::ScalarTraits<Scalar>::one ();
+    typedef typename Node::execution_space exec_space;
+
+    exec_space defaultSpace;
+    Teuchos::RCP<const exec_space> onRankSpace = 
+      space_instance<exec_space, Tpetra::Details::Spaces::Priority::low>();
+    Teuchos::RCP<const exec_space> offRankSpace = 
+      space_instance<exec_space, Tpetra::Details::Spaces::Priority::high>();
+
+    RCP<const import_type> importer = this->getGraph ()->getImporter ();
+    RCP<const export_type> exporter = this->getGraph ()->getExporter ();
+    const bool mustImport = !importer.is_null();
+    const bool mustExport = !exporter.is_null();
+
+    // If beta == 0, then the output MV will be overwritten; none of
+    // its entries should be read.  (Sparse BLAS semantics say that we
+    // must ignore any Inf or NaN entries in Y_in, if beta is zero.)
+    // This matters if we need to do an Export operation; see below.
+    const bool yIsOverwritten = (beta == ZERO);
+
+    // We treat the case of a replicated MV output specially.
+    // An all-reduce at the end will sum results, so only contribute
+    // replicated y input entries from one rank
+    const bool yIsReplicated =
+      (! Y_in.isDistributed () && this->getComm ()->getSize () != 1);
+    if (yIsReplicated && this->getComm ()->getRank () > 0) {
+      beta = ZERO;
+    }
+
+    // access X indirectly, in case we need to create temporary storage
+    RCP<const MV> X;
+
+    // The kernels do not allow input or output with nonconstant stride.
+    if (! X_in.isConstantStride () && ! mustImport) {
+      X = rcp (new MV (X_in, Teuchos::Copy)); // Constant-stride copy of X_in
+    } else {
+      X = rcpFromRef (X_in); // Reference to X_in
+    }
+
+    // Set up temporary multivectors for Import and/or Export.
+    if (mustImport) {
+      if (importMV_ != Teuchos::null && importMV_->getNumVectors() != numVectors) {
+        importMV_ = null;
+      }
+      if (importMV_ == null) {
+        importMV_ = rcp (new MV (this->getColMap (), numVectors));
+      }
+    }
+    if (mustExport) {
+      if (exportMV_ != Teuchos::null && exportMV_->getNumVectors() != numVectors) {
+        exportMV_ = null;
+      }
+      if (exportMV_ == null) {
+        exportMV_ = rcp (new MV (this->getRowMap (), numVectors));
+      }
+    }
+
+    if (mustImport) {
+      this->localApplyOnRank(*onRankSpace, X_in, *importMV_, mode, alpha, ZERO);
+    }
+
+    // If we have a non-trivial exporter, we must import elements that
+    // are permuted or are on other processors.
+    if (mustExport) {
+      ProfilingRegion regionImport ("Tpetra::CrsMatrix::apply (transpose): Import");
+      Details::Spaces::exec_space_wait(defaultSpace, *offRankSpace);
+      exportMV_->beginImport (X_in, *exporter, INSERT, false/*restrictedMode*/, *offRankSpace);
+      exportMV_->endImport (X_in, *exporter, INSERT, false/*restrictedMode*/, *offRankSpace);
+      X = exportMV_; // multiply out of exportMV_
+    }
+
+    // If we have a non-trivial importer, we must export elements that
+    // are permuted or belong to other processors.  We will compute
+    // solution into the to-be-exported MV; get a view.
+    if (mustImport) {
+      ProfilingRegion regionExport ("Tpetra::CrsMatrix::apply (transpose): Export");
+
+      // importMV_->putScalar (ZERO);
+      // Do the local computation.
+      Details::Spaces::exec_space_wait(*onRankSpace, defaultSpace); // wait for local SpMV
+      Details::Spaces::exec_space_wait(*offRankSpace, defaultSpace); // wait for import
+      this->localApplyOffRank (defaultSpace, *X, *importMV_, mode, alpha, ZERO);
+
+      if (Y_is_overwritten) {
+        Y_in.putScalar (ZERO);
+      } else {
+        Y_in.scale (beta);
+      }
+      Y_in.doExport (*importMV_, *importer, ADD_ASSIGN);
+    }
+    // otherwise, multiply into Y
+    else {
+      // can't multiply in-situ; can't multiply into non-strided multivector
+      //
+      // FIXME (mfh 05 Jun 2014) This test for aliasing only tests if
+      // the user passed in the same MultiVector for both X and Y.  It
+      // won't detect whether one MultiVector views the other.  We
+      // should also check the MultiVectors' raw data pointers.
+      Details::Spaces::exec_space_wait(*onRankSpace, defaultSpace); // wait for local SpMV
+      Details::Spaces::exec_space_wait(*offRankSpace, defaultSpace); // wait for import
+      if (! Y_in.isConstantStride () || X.getRawPtr () == &Y_in) {
+        // Make a deep copy of Y_in, into which to write the multiply result.
+        MV Y (Y_in, Teuchos::Copy);
+        this->localApplyOffRank (defaultSpace, *X, Y, mode, alpha, beta);
+        Tpetra::deep_copy (Y_in, Y);
+      } else {
+        this->localApplyOffRank (defaultSpace, *X, Y_in, mode, alpha, beta);
+      }
+    }
+
+    // If the range Map is a locally replicated map, sum the
+    // contributions from each process.  (That's why we set beta=0
+    // above for all processes but Proc 0.)
+    if (Y_is_replicated) {
+      ProfilingRegion regionReduce ("Tpetra::CrsMatrix::apply (transpose): Reduce Y");
+      Y_in.reduce ();
+    }
+  #endif
   }
 
   template <class Scalar, class LocalOrdinal, class GlobalOrdinal, class Node>
@@ -5003,6 +5365,7 @@ CrsMatrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>::
   {
     using Tpetra::Details::ProfilingRegion;
     using Teuchos::NO_TRANS;
+    typedef typename Node::execution_space exec_space;
     ProfilingRegion regionLocalApply ("Tpetra::CrsMatrix::localApply");
 
     auto X_lcl = X.getLocalViewDevice(Access::ReadOnly);
@@ -5077,12 +5440,177 @@ CrsMatrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>::
   template <class Scalar, class LocalOrdinal, class GlobalOrdinal, class Node>
   void
   CrsMatrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>::
+  localApplyOffRank (const typename Node::execution_space &execSpace,
+                     const MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node>& X,
+                     MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node>& Y,
+                     const Teuchos::ETransp mode,
+                     const Scalar& alpha) const
+  {
+    using Tpetra::Details::ProfilingRegion;
+    using Teuchos::NO_TRANS;
+    ProfilingRegion regionLocalApply ("Tpetra::CrsMatrix::localApplyOffRank");
+
+    auto X_lcl = X.getLocalViewDevice(Access::ReadOnly);
+    auto Y_lcl = Y.getLocalViewDevice(Access::ReadWrite);
+    auto matrix_lcl = getLocalMultiplyOperator();
+
+    const bool debug = ::Tpetra::Details::Behavior::debug ();
+    if (debug) {
+      const bool transpose = (mode != Teuchos::NO_TRANS);
+      const char tfecfFuncName[] = "localApplyOffRank: ";
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (X.getNumVectors () != Y.getNumVectors (), std::runtime_error,
+         "X.getNumVectors() = " << X.getNumVectors () << " != "
+         "Y.getNumVectors() = " << Y.getNumVectors () << ".");
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (! transpose && X.getLocalLength () !=
+         getColMap ()->getLocalNumElements (), std::runtime_error,
+         "NO_TRANS case: X has the wrong number of local rows.  "
+         "X.getLocalLength() = " << X.getLocalLength () << " != "
+         "getColMap()->getLocalNumElements() = " <<
+         getColMap ()->getLocalNumElements () << ".");
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (! transpose && Y.getLocalLength () !=
+         getRowMap ()->getLocalNumElements (), std::runtime_error,
+         "NO_TRANS case: Y has the wrong number of local rows.  "
+         "Y.getLocalLength() = " << Y.getLocalLength () << " != "
+         "getRowMap()->getLocalNumElements() = " <<
+         getRowMap ()->getLocalNumElements () << ".");
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (transpose && X.getLocalLength () !=
+         getRowMap ()->getLocalNumElements (), std::runtime_error,
+         "TRANS or CONJ_TRANS case: X has the wrong number of local "
+         "rows.  X.getLocalLength() = " << X.getLocalLength ()
+         << " != getRowMap()->getLocalNumElements() = "
+         << getRowMap ()->getLocalNumElements () << ".");
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (transpose && Y.getLocalLength () !=
+         getColMap ()->getLocalNumElements (), std::runtime_error,
+         "TRANS or CONJ_TRANS case: X has the wrong number of local "
+         "rows.  Y.getLocalLength() = " << Y.getLocalLength ()
+         << " != getColMap()->getLocalNumElements() = "
+         << getColMap ()->getLocalNumElements () << ".");
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (! isFillComplete (), std::runtime_error, "The matrix is not "
+         "fill complete.  You must call fillComplete() (possibly with "
+         "domain and range Map arguments) without an intervening "
+         "resumeFill() call before you may call this method.");
+      // If the two pointers are null, then they don't alias one
+      // another, even though they are equal.
+      // Kokkos does not guarantee that zero row-extent vectors 
+      // point to different places, so we have to check that too.
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (X_lcl.data () == Y_lcl.data () && X_lcl.data () != nullptr
+         && X_lcl.extent(0) != 0,
+         std::runtime_error, "X and Y may not alias one another.");
+    }
+
+    typedef typename crs_graph_type::offset_device_view_type OffsetDeviceViewType;
+    OffsetDeviceViewType offRankOffsets;
+    getCrsGraph()->getLocalOffRankOffsets(offRankOffsets, execSpace);
+    CWP_CERR(__FILE__ << ":" <<__LINE__ << " call applyRemoteColumns\n");
+    matrix_lcl->applyRemoteColumns (execSpace, X_lcl, Y_lcl, mode, alpha, Scalar(1), offRankOffsets);
+    CWP_CERR(__FILE__ << ":" <<__LINE__ << " CrsMatrix::localApplyOffRank() done\n");
+  }
+
+  template <class Scalar, class LocalOrdinal, class GlobalOrdinal, class Node>
+  void
+  CrsMatrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>::
+  localApplyOnRank (const typename Node::execution_space &execSpace,
+                    const MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node>& X,
+                    MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node>& Y,
+                    const Teuchos::ETransp mode,
+                    const Scalar& alpha,
+                    const Scalar& beta) const
+  {
+    using Tpetra::Details::ProfilingRegion;
+    using Teuchos::NO_TRANS;
+    ProfilingRegion regionLocalApply ("Tpetra::CrsMatrix::localApplyOnRank");
+
+    // std::cerr << "CWP: get X view..." << std::endl;
+    auto X_lcl = X.getLocalViewDevice(Access::ReadOnly);
+    // std::cerr << "CWP: get Y view..." << std::endl;
+    auto Y_lcl = Y.getLocalViewDevice(Access::ReadWrite);
+    // std::cerr << "CWP: get multiply op..." << std::endl;
+    auto matrix_lcl = getLocalMultiplyOperator();
+    // std::cerr << "CWP: got local operators and views" << std::endl;
+
+    const bool debug = ::Tpetra::Details::Behavior::debug ();
+    if (debug) {
+      const bool transpose = (mode != Teuchos::NO_TRANS);
+      const char tfecfFuncName[] = "localApplyOnRank: ";
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (X.getNumVectors () != Y.getNumVectors (), std::runtime_error,
+         "X.getNumVectors() = " << X.getNumVectors () << " != "
+         "Y.getNumVectors() = " << Y.getNumVectors () << ".");
+#if 0
+/*  for the on-rank portion, the SpMV may be called on the original X, not the
+    imported one.
+*/
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (! transpose && X.getLocalLength () !=
+         getColMap ()->getLocalNumElements (), std::runtime_error,
+         "NO_TRANS case: X has the wrong number of local rows.  "
+         "X.getLocalLength() = " << X.getLocalLength () << " != "
+         "getColMap()->getLocalNumElements() = " <<
+         getColMap ()->getLocalNumElements () << ".");
+#endif
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (! transpose && Y.getLocalLength () !=
+         getRowMap ()->getLocalNumElements (), std::runtime_error,
+         "NO_TRANS case: Y has the wrong number of local rows.  "
+         "Y.getLocalLength() = " << Y.getLocalLength () << " != "
+         "getRowMap()->getLocalNumElements() = " <<
+         getRowMap ()->getLocalNumElements () << ".");
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (transpose && X.getLocalLength () !=
+         getRowMap ()->getLocalNumElements (), std::runtime_error,
+         "TRANS or CONJ_TRANS case: X has the wrong number of local "
+         "rows.  X.getLocalLength() = " << X.getLocalLength ()
+         << " != getRowMap()->getLocalNumElements() = "
+         << getRowMap ()->getLocalNumElements () << ".");
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (transpose && Y.getLocalLength () !=
+         getColMap ()->getLocalNumElements (), std::runtime_error,
+         "TRANS or CONJ_TRANS case: X has the wrong number of local "
+         "rows.  Y.getLocalLength() = " << Y.getLocalLength ()
+         << " != getColMap()->getLocalNumElements() = "
+         << getColMap ()->getLocalNumElements () << ".");
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (! isFillComplete (), std::runtime_error, "The matrix is not "
+         "fill complete.  You must call fillComplete() (possibly with "
+         "domain and range Map arguments) without an intervening "
+         "resumeFill() call before you may call this method.");
+      // If the two pointers are null, then they don't alias one
+      // another, even though they are equal.
+      // Kokkos does not guarantee that zero row-extent vectors 
+      // point to different places, so we have to check that too.
+      TEUCHOS_TEST_FOR_EXCEPTION_CLASS_FUNC
+        (X_lcl.data () == Y_lcl.data () && X_lcl.data () != nullptr
+         && X_lcl.extent(0) != 0,
+         std::runtime_error, "X and Y may not alias one another.");
+    }
+
+    typedef typename crs_graph_type::offset_device_view_type OffsetDeviceViewType;
+    OffsetDeviceViewType offRankOffsets;
+    getCrsGraph()->getLocalOffRankOffsets(offRankOffsets, execSpace);
+    CWP_CERR(__FILE__ << ":" << __LINE__ << "\n");
+    matrix_lcl->applyLocalColumns (execSpace, X_lcl, Y_lcl, mode, alpha, beta, offRankOffsets);
+    CWP_CERR(__FILE__ << ":" << __LINE__ << "\n");
+  }
+
+
+  template <class Scalar, class LocalOrdinal, class GlobalOrdinal, class Node>
+  void
+  CrsMatrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>::
   apply (const MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node> &X,
          MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node> &Y,
          Teuchos::ETransp mode,
          Scalar alpha,
          Scalar beta) const
   {
+    // CWP_CERR(__FILE__ << ":" << __LINE__ << ": CrsMatrix::apply\n");
+
     using Tpetra::Details::ProfilingRegion;
     const char fnName[] = "Tpetra::CrsMatrix::apply";
 

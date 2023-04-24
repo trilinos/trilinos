@@ -53,12 +53,14 @@
 #include "Tpetra_Details_Behavior.hpp"
 #include "Tpetra_Details_checkGlobalError.hpp"
 #include "Tpetra_Details_Profiling.hpp"
+#include "Tpetra_Details_Spaces.hpp"
 #include "Tpetra_Util.hpp" // Details::createPrefix
 #include "Teuchos_CommHelpers.hpp"
 #include "Teuchos_TypeNameTraits.hpp"
 #include <typeinfo>
 #include <memory>
 #include <sstream>
+
 
 namespace Tpetra {
 
@@ -134,6 +136,22 @@ namespace Tpetra {
         TimeMonitor::getNewCounter ("Tpetra::DistObject::doPostsAndWaits");
     }
     doPostsAndWaitsTimer_ = doPostsAndWaitsTimer;
+
+    RCP<Time> doPostsTimer =
+      TimeMonitor::lookupCounter ("Tpetra::DistObject::doPosts");
+    if (doPostsTimer.is_null ()) {
+      doPostsTimer =
+        TimeMonitor::getNewCounter ("Tpetra::DistObject::doPosts");
+    }
+    doPostsTimer_ = doPostsTimer;
+
+    RCP<Time> doWaitsTimer =
+      TimeMonitor::lookupCounter ("Tpetra::DistObject::doWaits");
+    if (doWaitsTimer.is_null ()) {
+      doWaitsTimer =
+        TimeMonitor::getNewCounter ("Tpetra::DistObject::doWaits");
+    }
+    doWaitsTimer_ = doWaitsTimer;
 
     RCP<Time> unpackAndCombineTimer =
       TimeMonitor::lookupCounter ("Tpetra::DistObject::unpackAndCombine");
@@ -404,8 +422,10 @@ namespace Tpetra {
   beginImport(const SrcDistObject& source,
               const Import<LocalOrdinal, GlobalOrdinal, Node>& importer,
               const CombineMode CM,
-              const bool restrictedMode)
+              const bool restrictedMode,
+              const typename Node::execution_space &space)
   {
+
     using Details::Behavior;
     using std::endl;
     const char modeString[] = "beginImport (forward mode)";
@@ -421,7 +441,7 @@ namespace Tpetra {
       os << *prefix << "Start" << endl;
       std::cerr << os.str ();
     }
-    this->beginTransfer(source, importer, modeString, DoForward, CM, restrictedMode);
+    this->beginTransfer(source, importer, modeString, DoForward, CM, restrictedMode, space);
     if (verbose) {
       std::ostringstream os;
       os << *prefix << "Done" << endl;
@@ -528,8 +548,14 @@ namespace Tpetra {
   endImport(const SrcDistObject& source,
             const Import<LocalOrdinal, GlobalOrdinal, Node>& importer,
             const CombineMode CM,
-            const bool restrictedMode)
+            const bool restrictedMode,
+            const typename Node::execution_space &space)
   {
+
+    // std::cerr << __FILE__ << ":" << __LINE__ << ": endImport(..., ";
+    // Tpetra::Spaces::detail::print_space(space);
+    // std::cerr << ")\n";
+
     using Details::Behavior;
     using std::endl;
     const char modeString[] = "endImport (forward mode)";
@@ -545,7 +571,7 @@ namespace Tpetra {
       os << *prefix << "Start" << endl;
       std::cerr << os.str ();
     }
-    this->endTransfer(source, importer, modeString, DoForward, CM, restrictedMode);
+    this->endTransfer(source, importer, modeString, DoForward, CM, restrictedMode, space);
     if (verbose) {
       std::ostringstream os;
       os << *prefix << "Done" << endl;
@@ -787,7 +813,8 @@ namespace Tpetra {
                 const char modeString[],
                 const ReverseOption revOp,
                 const CombineMode CM,
-                bool restrictedMode)
+                bool restrictedMode,
+                const execution_space &space)
   {
     using Details::Behavior;
     using ::Tpetra::Details::dualViewStatusToString;
@@ -800,14 +827,14 @@ namespace Tpetra {
     using std::endl;
     using Details::getDualViewCopyFromArrayView;
     using Details::ProfilingRegion;
-    const char funcName[] = "Tpetra::DistObject::doTransfer";
+    const char funcName[] = "Tpetra::DistObject::beginTransfer";
 
-    ProfilingRegion region_doTransfer(funcName);
+    ProfilingRegion region_beginTransfer(funcName);
     const bool verbose = Behavior::verbose("DistObject");
     std::shared_ptr<std::string> prefix;
     if (verbose) {
       std::ostringstream os;
-      prefix = this->createPrefix("DistObject", "doTransfer");
+      prefix = this->createPrefix("DistObject", "beginTransfer");
       os << *prefix << "Source type: " << Teuchos::typeName(src)
          << ", Target type: " << Teuchos::typeName(*this) << endl;
       std::cerr << os.str();
@@ -906,9 +933,15 @@ namespace Tpetra {
 
     // Do we need all communication buffers to live on host?
     const bool commOnHost = ! Behavior::assumeMpiIsGPUAware ();
+    if (commOnHost) {
+      Tpetra::Details::mark("not GPU-aware");
+    } else {
+      Tpetra::Details::mark("GPU-aware");
+    }
+    
     if (verbose) {
       std::ostringstream os;
-      os << *prefix << "doTransfer: Use new interface; "
+      os << *prefix << "beginTransfer: Use new interface; "
         "commOnHost=" << (commOnHost ? "true" : "false") << endl;
       std::cerr << os.str ();
     }
@@ -958,7 +991,7 @@ namespace Tpetra {
     }
 
     {
-      ProfilingRegion region_cs ("Tpetra::DistObject::doTransferNew::checkSizes");
+      ProfilingRegion region_cs ("Tpetra::DistObject::beginTransfer::checkSizes");
       if (verbose) {
         std::ostringstream os;
         os << *prefix << "1. checkSizes" << endl;
@@ -967,7 +1000,7 @@ namespace Tpetra {
       const bool checkSizesResult = this->checkSizes (src);
       TEUCHOS_TEST_FOR_EXCEPTION
         (! checkSizesResult, std::invalid_argument,
-         "Tpetra::DistObject::doTransfer: checkSizes() indicates that the "
+         "Tpetra::DistObject::beginTransfer: checkSizes() indicates that the "
          "destination object is not a legal target for redistribution from the "
          "source object.  This probably means that they do not have the same "
          "dimensions.  For example, MultiVectors must have the same number of "
@@ -986,7 +1019,7 @@ namespace Tpetra {
         std::cerr << os.str ();
       }
       ProfilingRegion region_cp
-        ("Tpetra::DistObject::doTransferNew::copyAndPermute");
+        ("Tpetra::DistObject::beginTransfer::copyAndPermute");
 #ifdef HAVE_TPETRA_TRANSFER_TIMERS
       // FIXME (mfh 04 Feb 2019) Deprecate Teuchos::TimeMonitor in favor
       // of Kokkos profiling.
@@ -1001,7 +1034,7 @@ namespace Tpetra {
           std::cerr << os.str ();
         }
         this->copyAndPermute (src, numSameIDs, permuteToLIDs,
-                              permuteFromLIDs, CM);
+                              permuteFromLIDs, CM, space);
         if (verbose) {
           std::ostringstream os;
           os << *prefix << "After copyAndPermute:" << endl
@@ -1043,10 +1076,24 @@ namespace Tpetra {
              << endl;
           std::cerr << os.str ();
         }
+
+        // reallocArraysForNumPacketsPerLid fences the default space
+        // before possibly reallocating.
+        // TODO: provide an instance to reallocArraysForNumPacketsPerLid
+        // to sync with
+        Tpetra::Details::Spaces::exec_space_wait(space, execution_space());
+
         // This only reallocates if necessary, that is, if the sizes
         // don't match.
-        this->reallocArraysForNumPacketsPerLid (exportLIDs.extent (0),
-                                                remoteLIDs.extent (0));
+        bool anyReallocated = this->reallocArraysForNumPacketsPerLid (
+             exportLIDs.extent (0), remoteLIDs.extent (0));
+
+
+        // reallocArrays happens in the default space, so let's make sure
+        // it's done before moving on
+        if (anyReallocated) {
+          Tpetra::Details::Spaces::exec_space_wait(execution_space(), space);
+        }
       }
 
       if (verbose) {
@@ -1057,15 +1104,21 @@ namespace Tpetra {
         std::cerr << os.str ();
       }
 
-      doPackAndPrepare(src, exportLIDs, constantNumPackets);
+      doPackAndPrepare(src, exportLIDs, constantNumPackets, space);
+
       if (commOnHost) {
-        this->exports_.sync_host();
+        ProfilingRegion region_cp 
+          ("Tpetra::DistObject::beginTransfer::sync_host");
+        this->exports_.sync_host(space);
       }
       else {
-        this->exports_.sync_device();
+        ProfilingRegion region_cp 
+          ("Tpetra::DistObject::beginTransfer::sync_device");
+        this->exports_.sync_device(space);
       }
 
       if (verbose) {
+        space.fence("(verbose) sync before verbose output");
         std::ostringstream os;
         os << *prefix << "5.1. After packAndPrepare, "
            << dualViewStatusToString (this->exports_, "exports_")
@@ -1082,7 +1135,14 @@ namespace Tpetra {
         // elements) how many incoming elements we expect, so we can
         // resize the buffer accordingly.
         const size_t rbufLen = remoteLIDs.extent (0) * constantNumPackets;
-        reallocImportsIfNeeded (rbufLen, verbose, prefix.get (), canTryAliasing, CM);
+
+        // reallocImportsIfNeeded happens in the default instance
+        Tpetra::Details::Spaces::exec_space_wait(space, execution_space());
+        bool reallocated = reallocImportsIfNeeded (
+          rbufLen, verbose, prefix.get (), canTryAliasing, CM);
+        if (reallocated) {
+          Tpetra::Details::Spaces::exec_space_wait(execution_space(), space);
+        }
       }
 
       // Do we need to do communication (via doPostsAndWaits)?
@@ -1114,12 +1174,12 @@ namespace Tpetra {
         }
       }
       else {
-        ProfilingRegion region_dpw
-          ("Tpetra::DistObject::doTransferNew::doPostsAndWaits");
+        ProfilingRegion region_dp
+          ("Tpetra::DistObject::beginTransfer::doPosts");
 #ifdef HAVE_TPETRA_TRANSFER_TIMERS
         // FIXME (mfh 04 Feb 2019) Deprecate Teuchos::TimeMonitor in
         // favor of Kokkos profiling.
-        Teuchos::TimeMonitor doPostsAndWaitsMon (*doPostsAndWaitsTimer_);
+        Teuchos::TimeMonitor doPostsMon (*doPostsTimer_);
 #endif // HAVE_TPETRA_TRANSFER_TIMERS
 
         if (verbose) {
@@ -1130,6 +1190,8 @@ namespace Tpetra {
           std::cerr << os.str ();
         }
 
+        // ensure pack/prepare and data transfers actually done
+        space.fence("before doPosts");
         doPosts(distributorPlan, constantNumPackets, commOnHost, prefix, canTryAliasing, CM);
       } // if (needCommunication)
     } // if (CM != ZERO)
@@ -1143,7 +1205,8 @@ namespace Tpetra {
               const char modeString[],
               const ReverseOption revOp,
               const CombineMode CM,
-              bool restrictedMode)
+              bool restrictedMode,
+              const execution_space &space)
   {
     using Details::Behavior;
     using ::Tpetra::Details::dualViewStatusToString;
@@ -1156,14 +1219,14 @@ namespace Tpetra {
     using std::endl;
     using Details::getDualViewCopyFromArrayView;
     using Details::ProfilingRegion;
-    const char funcName[] = "Tpetra::DistObject::doTransfer";
+    const char funcName[] = "Tpetra::DistObject::endTransfer";
 
-    ProfilingRegion region_doTransfer(funcName);
+    ProfilingRegion region_endTransfer(funcName);
     const bool verbose = Behavior::verbose("DistObject");
     std::shared_ptr<std::string> prefix;
     if (verbose) {
       std::ostringstream os;
-      prefix = this->createPrefix("DistObject", "doTransfer");
+      prefix = this->createPrefix("DistObject", "endTransfer");
       os << *prefix << "Source type: " << Teuchos::typeName(src)
          << ", Target type: " << Teuchos::typeName(*this) << endl;
       std::cerr << os.str();
@@ -1263,7 +1326,7 @@ namespace Tpetra {
     const bool commOnHost = ! Behavior::assumeMpiIsGPUAware ();
     if (verbose) {
       std::ostringstream os;
-      os << *prefix << "doTransfer: Use new interface; "
+      os << *prefix << "endTransfer: Use new interface; "
         "commOnHost=" << (commOnHost ? "true" : "false") << endl;
       std::cerr << os.str ();
     }
@@ -1296,7 +1359,13 @@ namespace Tpetra {
         // elements) how many incoming elements we expect, so we can
         // resize the buffer accordingly.
         const size_t rbufLen = remoteLIDs.extent (0) * constantNumPackets;
-        reallocImportsIfNeeded (rbufLen, verbose, prefix.get (), canTryAliasing, CM);
+
+        Tpetra::Details::Spaces::exec_space_wait("before reallocImportsIfNeeded", space, execution_space());
+        const bool reallocated = reallocImportsIfNeeded (
+          rbufLen, verbose, prefix.get (), canTryAliasing, CM);
+        if (reallocated) {
+          Tpetra::Details::Spaces::exec_space_wait("reallocImportsIfNeeded reallocated", execution_space(), space);
+        }
       }
 
       // Do we need to do communication (via doPostsAndWaits)?
@@ -1335,7 +1404,7 @@ namespace Tpetra {
           os << *prefix << "8. unpackAndCombine - remoteLIDs " << remoteLIDs.extent(0) << ", constantNumPackets " << constantNumPackets << endl;
           std::cerr << os.str ();
         }
-        doUnpackAndCombine(remoteLIDs, constantNumPackets, CM);
+        doUnpackAndCombine(remoteLIDs, constantNumPackets, CM, space);
       } // if (needCommunication)
     } // if (CM != ZERO)
 
@@ -1347,7 +1416,7 @@ namespace Tpetra {
 
     if (verbose) {
       std::ostringstream os;
-      os << *prefix << "Tpetra::DistObject::doTransfer: Done!" << endl;
+      os << *prefix << "Tpetra::DistObject::endTransfer: Done!" << endl;
       std::cerr << os.str ();
     }
   }
@@ -1490,7 +1559,12 @@ namespace Tpetra {
            numImportPacketsPerLID_av);
       }
       else { // pack on device
-        Kokkos::fence(); // for UVM
+        // CWP May 19 2022: I don't think this is just for UVM. Consider
+        // packing into a GPU buffer and then calling MPI_Send - we have to
+        // sync the stream first
+        // FIXME: how to actually get the current space? is this right?
+        // Kokkos::fence("for UVM 1");
+        Kokkos::DefaultExecutionSpace().fence("for UVM 1");
         this->imports_.modify_device ();
         distributorActor_.doPosts
           (distributorPlan,
@@ -1535,7 +1609,12 @@ namespace Tpetra {
            this->imports_.view_host ());
       }
       else { // pack on device
-        Kokkos::fence(); // for UVM
+      // CWP: okay to remove?
+        // CWP May 19 2022: I don't think this is just for UVM. Consider
+        // packing into a GPU buffer and then calling MPI_Send - we have to
+        // sync the stream first
+        // Kokkos::fence("for UVM 2");
+        Kokkos::DefaultExecutionSpace().fence("for UVM 2");
         this->imports_.modify_device ();
         distributorActor_.doPosts
           (distributorPlan,
@@ -1551,14 +1630,14 @@ namespace Tpetra {
   DistObject<Packet, LocalOrdinal, GlobalOrdinal, Node>::
   doPackAndPrepare(const SrcDistObject& src,
                    const Kokkos::DualView<const local_ordinal_type*, buffer_device_type>& exportLIDs,
-                   size_t& constantNumPackets)
+                   size_t& constantNumPackets, const execution_space &space)
   {
     using Details::ProfilingRegion;
     using std::endl;
     const bool debug = Details::Behavior::debug("DistObject");
 
     ProfilingRegion region_pp
-      ("Tpetra::DistObject::doTransferNew::packAndPrepare");
+      ("Tpetra::DistObject::doPackAndPrepare");
 #ifdef HAVE_TPETRA_TRANSFER_TIMERS
     // FIXME (mfh 04 Feb 2019) Deprecate Teuchos::TimeMonitor in
     // favor of Kokkos profiling.
@@ -1587,7 +1666,7 @@ namespace Tpetra {
       try {
         this->packAndPrepare (src, exportLIDs, this->exports_,
             this->numExportPacketsPerLID_,
-            constantNumPackets);
+            constantNumPackets, space);
         lclSuccess = true;
       }
       catch (std::exception& e) {
@@ -1609,7 +1688,7 @@ namespace Tpetra {
     else {
       this->packAndPrepare (src, exportLIDs, this->exports_,
           this->numExportPacketsPerLID_,
-          constantNumPackets);
+          constantNumPackets, space);
     }
   }
 
@@ -1618,14 +1697,14 @@ namespace Tpetra {
   DistObject<Packet, LocalOrdinal, GlobalOrdinal, Node>::
   doUnpackAndCombine(const Kokkos::DualView<const local_ordinal_type*, buffer_device_type>& remoteLIDs,
                      size_t constantNumPackets,
-                     CombineMode CM)
+                     CombineMode CM, const execution_space &space)
   {
     using Details::ProfilingRegion;
     using std::endl;
     const bool debug = Details::Behavior::debug("DistObject");
 
     ProfilingRegion region_uc
-      ("Tpetra::DistObject::doTransferNew::unpackAndCombine");
+      ("Tpetra::DistObject::doUnpackAndCombine");
 #ifdef HAVE_TPETRA_TRANSFER_TIMERS
     // FIXME (mfh 04 Feb 2019) Deprecate Teuchos::TimeMonitor in
     // favor of Kokkos profiling.
@@ -1638,7 +1717,7 @@ namespace Tpetra {
       try {
         this->unpackAndCombine (remoteLIDs, this->imports_,
             this->numImportPacketsPerLID_,
-            constantNumPackets, CM);
+            constantNumPackets, CM, space);
         lclSuccess = true;
       }
       catch (std::exception& e) {
@@ -1660,40 +1739,96 @@ namespace Tpetra {
     else {
       this->unpackAndCombine (remoteLIDs, this->imports_,
           this->numImportPacketsPerLID_,
-          constantNumPackets, CM);
+          constantNumPackets, CM, space);
     }
+  }
+
+
+  template <class Packet, class LocalOrdinal, class GlobalOrdinal, class Node>
+  void
+  DistObject<Packet, LocalOrdinal, GlobalOrdinal, Node>::
+  copyAndPermute
+  (const SrcDistObject &a,
+   const size_t b,
+   const Kokkos::DualView<
+     const local_ordinal_type*,
+     buffer_device_type> &c,
+   const Kokkos::DualView<
+     const local_ordinal_type*,
+     buffer_device_type>& d,
+   const CombineMode CM,
+   const execution_space &space)
+  {
+    /*
+    we're here if the derived class doesn't know how to do this in an
+    execution space instance, so just do it in the default instance
+    */
+
+    /* wait for any operations in the provided instance we may depend on
+       do this in the default instance, then have the
+       provided instance wait for the default instance to finish this
+       before proceeding */
+
+    Tpetra::Details::Spaces::exec_space_wait(space, execution_space());
+    copyAndPermute(a, b, c, d, CM); // default instance
+    Tpetra::Details::Spaces::exec_space_wait(execution_space(), space);
   }
 
   template <class Packet, class LocalOrdinal, class GlobalOrdinal, class Node>
   void
   DistObject<Packet, LocalOrdinal, GlobalOrdinal, Node>::
   copyAndPermute
-  (const SrcDistObject&,
-   const size_t,
+  (const SrcDistObject &a,
+   const size_t b,
    const Kokkos::DualView<
      const local_ordinal_type*,
-     buffer_device_type>&,
+     buffer_device_type> &c,
    const Kokkos::DualView<
      const local_ordinal_type*,
-     buffer_device_type>&,
+     buffer_device_type> &d,
    const CombineMode CM)
-  {}
+  {
+  }  
 
   template <class Packet, class LocalOrdinal, class GlobalOrdinal, class Node>
   void
   DistObject<Packet, LocalOrdinal, GlobalOrdinal, Node>::
-  packAndPrepare
-  (const SrcDistObject&,
-   const Kokkos::DualView<
-     const local_ordinal_type*,
-     buffer_device_type>&,
-   Kokkos::DualView<
-     packet_type*,
-     buffer_device_type>&,
-   Kokkos::DualView<
-     size_t*,
-     buffer_device_type>,
-   size_t&)
+  packAndPrepare (const SrcDistObject& source,
+                    const Kokkos::DualView<const local_ordinal_type*,
+                      buffer_device_type>& exportLIDs,
+                    Kokkos::DualView<packet_type*,
+                      buffer_device_type>& exports,
+                    Kokkos::DualView<size_t*,
+                      buffer_device_type> numPacketsPerLID,
+                    size_t& constantNumPackets,
+                    const execution_space &space)
+  {
+    /*
+    we're here if the derived class doesn't know how to do this in an
+    execution space instance, so just do it in the default instance
+    */
+
+    /* wait for any operations in the provided instance we may depend on
+       do this in the default instance, then have the
+       provided instance wait for the default instance to finish this
+       before proceeding */
+
+    Details::Spaces::exec_space_wait(space, execution_space());
+    packAndPrepare(source, exportLIDs, exports, numPacketsPerLID, constantNumPackets); // default instance
+    Details::Spaces::exec_space_wait(execution_space(), space);
+  }
+
+  template <class Packet, class LocalOrdinal, class GlobalOrdinal, class Node>
+  void
+  DistObject<Packet, LocalOrdinal, GlobalOrdinal, Node>::
+  packAndPrepare (const SrcDistObject& source,
+                    const Kokkos::DualView<const local_ordinal_type*,
+                      buffer_device_type>& exportLIDs,
+                    Kokkos::DualView<packet_type*,
+                      buffer_device_type>& exports,
+                    Kokkos::DualView<size_t*,
+                      buffer_device_type> numPacketsPerLID,
+                    size_t& constantNumPackets)
   {}
 
   template <class Packet, class LocalOrdinal, class GlobalOrdinal, class Node>
@@ -1702,17 +1837,47 @@ namespace Tpetra {
   unpackAndCombine
   (const Kokkos::DualView<
      const local_ordinal_type*,
-     buffer_device_type>& /* importLIDs */,
+     buffer_device_type>&  importLIDs ,
    Kokkos::DualView<
      packet_type*,
-     buffer_device_type> /* imports */,
+     buffer_device_type>  imports ,
    Kokkos::DualView<
      size_t*,
-     buffer_device_type> /* numPacketsPerLID */,
-   const size_t /* constantNumPackets */,
-   const CombineMode /* combineMode */)
+     buffer_device_type>  numPacketsPerLID ,
+   const size_t /*constantNumPackets*/ ,
+   const CombineMode /*CM*/ )
   {}
 
+  template <class Packet, class LocalOrdinal, class GlobalOrdinal, class Node>
+  void
+  DistObject<Packet, LocalOrdinal, GlobalOrdinal, Node>::
+  unpackAndCombine
+  (const Kokkos::DualView<
+     const local_ordinal_type*,
+     buffer_device_type> &importLIDs,
+   Kokkos::DualView<
+     packet_type*,
+     buffer_device_type> imports,
+   Kokkos::DualView<
+     size_t*,
+     buffer_device_type> numPacketsPerLID,
+   const size_t constantNumPackets,
+   const CombineMode CM,
+   const execution_space &space)
+  {
+    /*
+    we're here if the derived class doesn't know how to do this in an
+    execution space instance, so just do it in the default instance
+    */
+
+    /* wait for any operations in the provided instance we may depend on
+       do this in the default instance, then have the
+       provided instance wait for the default instance to finish this
+       before proceeding */
+    Details::Spaces::exec_space_wait(space, execution_space());
+    unpackAndCombine(importLIDs, imports, numPacketsPerLID, constantNumPackets, CM); // default instance
+    Details::Spaces::exec_space_wait(execution_space(), space);
+  }
 
   template <class Packet, class LocalOrdinal, class GlobalOrdinal, class Node>
   void

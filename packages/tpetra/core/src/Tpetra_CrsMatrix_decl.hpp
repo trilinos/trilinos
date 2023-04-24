@@ -54,6 +54,7 @@
 #include "KokkosSparse_Utils.hpp"
 #include "KokkosSparse_CrsMatrix.hpp"
 #include "Teuchos_DataAccess.hpp"
+#include "Tpetra_Details_SpaceManager.hpp"
 
 #include <memory> // std::shared_ptr
 
@@ -423,11 +424,15 @@ namespace Tpetra {
             class Node>
   class CrsMatrix :
     public RowMatrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>,
-    public DistObject<char, LocalOrdinal, GlobalOrdinal, Node>
+    public DistObject<char, LocalOrdinal, GlobalOrdinal, Node>,
+    public Details::SpaceUser
   {
   public:
     //! @name Typedefs
     //@{
+
+    //! Type of the DistObject specialization from which this class inherits.
+    using dist_object_type = DistObject<char, LocalOrdinal, GlobalOrdinal, Node>;
 
     //! The type of each entry in the matrix.
     using scalar_type = Scalar;
@@ -2853,6 +2858,39 @@ public:
                 const Scalar& alpha = Teuchos::ScalarTraits<Scalar>::one (),
                 const Scalar& beta = Teuchos::ScalarTraits<Scalar>::zero ()) const;
 
+    /*! \brief cwp 06 Apr 2022
+
+    Like \c localApply, except do only the contributions from on-rank columns
+    Should be coupled with localApplyOffRank after import for a full SpMV
+    \c localApplyOnRank needs to finish executing before \c localApplyOffRank starts
+
+    This does Y = alpha A_l X + beta Y, where A_l contains the entries of A corresponding
+    to the on-rank X entries (i.e., X entries that do not need to be imported)
+    Therefore, this can be used concurrently with import to overlap SpMV computation
+    with communication.
+    */
+    void
+    localApplyOnRank ( const typename Node::execution_space &execSpace,
+                const MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node>& X,
+                MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node>&Y,
+                const Teuchos::ETransp mode = Teuchos::NO_TRANS,
+                const Scalar& alpha = Teuchos::ScalarTraits<Scalar>::one (),
+                const Scalar& beta = Teuchos::ScalarTraits<Scalar>::zero ()) const;
+
+    /*! \brief cwp 06 Apr 2022
+
+        \c localApplyOnRank() must be called first!
+
+        This does an additional Y = alpha A_r X + Y, where A_r contains the entries
+        of A corresponding to off-rank X entries (X entries that will be imported).
+    */
+    void
+    localApplyOffRank (const typename Node::execution_space &execSpace,
+                const MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node>& X,
+                MultiVector<Scalar, LocalOrdinal, GlobalOrdinal, Node>&Y,
+                const Teuchos::ETransp mode = Teuchos::NO_TRANS,
+                const Scalar& alpha = Teuchos::ScalarTraits<Scalar>::one ()) const;
+
     /// \brief Return another CrsMatrix with the same entries, but
     ///   converted to a different Scalar type \c T.
     template <class T>
@@ -2973,6 +3011,10 @@ public:
       const size_t numPermutes);
 
   protected:
+    // copyAndPermute has two implementations in DistObject, use
+    // the base class ones whenever we don't overload
+    using dist_object_type::copyAndPermute;
+
     virtual void
     copyAndPermute
     (const SrcDistObject& source,
@@ -2984,6 +3026,10 @@ public:
        const local_ordinal_type*,
        buffer_device_type>& permuteFromLIDs,
      const CombineMode CM) override;
+
+    // packAndPrepare has two implementations in DistObject, use
+    // the base class ones whenever we don't overload
+    using dist_object_type::packAndPrepare;
 
     virtual void
     packAndPrepare
@@ -3020,6 +3066,11 @@ public:
       const CombineMode combineMode);
 
   public:
+
+    // unpackAndCombine has two implementations in DistObject, use
+    // the base class ones whenever we don't overload
+    using dist_object_type::unpackAndCombine;
+
     /// \brief Unpack the imported column indices and values, and
     ///   combine into matrix.
     ///
@@ -3706,9 +3757,6 @@ public:
                             const ELocalGlobal lg,
                             const ELocalGlobal I);
 
-    //! Type of the DistObject specialization from which this class inherits.
-    typedef DistObject<char, LocalOrdinal, GlobalOrdinal, Node> dist_object_type;
-
   protected:
     // useful typedefs
     typedef Teuchos::OrdinalTraits<LocalOrdinal> OTL;
@@ -3782,35 +3830,6 @@ public:
     //! Returns true if globalConstants have been computed; false otherwise
     bool haveGlobalConstants() const;
 
-  protected:
-    /// \brief Column Map MultiVector used in apply().
-    ///
-    /// This is a column Map MultiVector.  It is used as the target of
-    /// the forward mode Import operation (if necessary) in apply(),
-    /// and the source of the reverse mode Export
-    /// operation (if necessary) in these methods.  Both of these
-    /// methods create this MultiVector on demand if needed, and reuse
-    /// it (if possible) for subsequent calls.
-    ///
-    /// This is declared <tt>mutable</tt> because the methods in
-    /// question are const, yet want to cache the MultiVector for
-    /// later use.
-    mutable Teuchos::RCP<MV> importMV_;
-
-    /// \brief Row Map MultiVector used in apply().
-    ///
-    /// This is a row Map MultiVector.  It is uses as the source of
-    /// the forward mode Export operation (if necessary) in apply(),
-    /// and the target of the reverse mode Import
-    /// operation (if necessary) in these methods.  Both of these
-    /// methods create this MultiVector on demand if needed, and reuse
-    /// it (if possible) for subsequent calls.
-    ///
-    /// This is declared <tt>mutable</tt> because the methods in
-    /// question are const, yet want to cache the MultiVector for
-    /// later use.
-    mutable Teuchos::RCP<MV> exportMV_;
-
     /// \brief Create a (or fetch a cached) column Map MultiVector.
     ///
     /// \param X_domainMap [in] A domain Map Multivector.  The
@@ -3859,10 +3878,54 @@ public:
     getRowMapMultiVector (const MV& Y_rangeMap,
                           const bool force = false) const;
 
+  protected:
+    /// \brief Column Map MultiVector used in apply().
+    ///
+    /// This is a column Map MultiVector.  It is used as the target of
+    /// the forward mode Import operation (if necessary) in apply(),
+    /// and the source of the reverse mode Export
+    /// operation (if necessary) in these methods.  Both of these
+    /// methods create this MultiVector on demand if needed, and reuse
+    /// it (if possible) for subsequent calls.
+    ///
+    /// This is declared <tt>mutable</tt> because the methods in
+    /// question are const, yet want to cache the MultiVector for
+    /// later use.
+    mutable Teuchos::RCP<MV> importMV_;
+
+    /// \brief Row Map MultiVector used in apply().
+    ///
+    /// This is a row Map MultiVector.  It is uses as the source of
+    /// the forward mode Export operation (if necessary) in apply(),
+    /// and the target of the reverse mode Import
+    /// operation (if necessary) in these methods.  Both of these
+    /// methods create this MultiVector on demand if needed, and reuse
+    /// it (if possible) for subsequent calls.
+    ///
+    /// This is declared <tt>mutable</tt> because the methods in
+    /// question are const, yet want to cache the MultiVector for
+    /// later use.
+    mutable Teuchos::RCP<MV> exportMV_;
+
+    
+
+    void
+    applyNonTransposeOverlapped (const MV& X_in,
+                       MV& Y_in,
+                       Scalar alpha,
+                       Scalar beta) const;
+
     //! Special case of apply() for <tt>mode == Teuchos::NO_TRANS</tt>.
     void
     applyNonTranspose (const MV& X_in,
                        MV& Y_in,
+                       Scalar alpha,
+                       Scalar beta) const;
+
+    void
+    applyTransposeOverlapped (const MV& X_in,
+                       MV& Y_in,
+                       const Teuchos::ETransp &mode,
                        Scalar alpha,
                        Scalar beta) const;
 

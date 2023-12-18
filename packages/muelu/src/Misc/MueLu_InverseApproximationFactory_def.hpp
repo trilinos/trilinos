@@ -46,11 +46,14 @@
 #ifndef MUELU_INVERSEAPPROXIMATIONFACTORY_DEF_HPP_
 #define MUELU_INVERSEAPPROXIMATIONFACTORY_DEF_HPP_
 
+#include <Xpetra_CrsGraphFactory.hpp>
+#include <Xpetra_CrsGraph.hpp>
 #include <Xpetra_BlockedCrsMatrix.hpp>
 #include <Xpetra_CrsGraph.hpp>
 #include <Xpetra_CrsGraphFactory.hpp>
 #include <Xpetra_CrsMatrixWrap.hpp>
 #include <Xpetra_CrsMatrix.hpp>
+#include <Xpetra_GraphUtils.hpp>
 #include <Xpetra_MultiVectorFactory.hpp>
 #include <Xpetra_VectorFactory.hpp>
 #include <Xpetra_MatrixFactory.hpp>
@@ -65,7 +68,10 @@
 #include "MueLu_Level.hpp"
 #include "MueLu_Monitor.hpp"
 #include "MueLu_Utilities.hpp"
+#include "MueLu_ThresholdAFilterFactory_decl.hpp"
 #include "MueLu_InverseApproximationFactory_decl.hpp"
+
+#include <Tpetra_Import_decl.hpp>
 
 namespace MueLu {
 
@@ -79,6 +85,7 @@ namespace MueLu {
     validParamList->set<std::string>            ("inverse: approximation type",  "diagonal", "Method used to approximate the inverse.");
     validParamList->set<Magnitude>              ("inverse: drop tolerance",      0.0       , "Values below this threshold  are dropped from the matrix (or fixed if diagonal fixing is active).");
     validParamList->set<bool>                   ("inverse: fixing",              false     , "Keep diagonal and fix small entries with 1.0");
+    validParamList->set<int>                    ("inverse: level-of-fill",       1         , "Factor used to calculate the power of the static inverse sparsity pattern");
 
     return validParamList;
   }
@@ -131,8 +138,18 @@ namespace MueLu {
     else if(method=="sparseapproxinverse")
     {
       RCP<CrsGraph> sparsityPattern = Utilities::GetThresholdedGraph(A, tol, A->getGlobalMaxNumRowEntries());
-      GetOStream(Statistics1) << "NNZ Graph(A): " << A->getCrsGraph()->getGlobalNumEntries() << " , NNZ Tresholded Graph(A): " << sparsityPattern->getGlobalNumEntries() << std::endl;
-      RCP<Matrix> pAinv = GetSparseInverse(A, sparsityPattern);
+      GetOStream(Statistics1) << "NNZ Graph(A): " << A->getCrsGraph()->getGlobalNumEntries() << " , NZZ Tresholded Graph(A): " << sparsityPattern->getGlobalNumEntries() << std::endl;
+
+      const int levelFill = pL.get<int>("inverse: level-of-fill");
+      TEUCHOS_TEST_FOR_EXCEPTION(levelFill < 1, Exceptions::RuntimeError, "MueLu::InverseApproximationFactory::Build: Power has to be greater equal to one.");
+
+      RCP<const CrsGraph> newSparsityPattern = sparsityPattern;
+      if(levelFill > 1)
+        newSparsityPattern =
+                Xpetra::GraphUtils<Scalar, LocalOrdinal, GlobalOrdinal, Node>::getExponentialCrsGraph(newSparsityPattern, levelFill, GetOStream(Statistics2));
+
+      RCP<Matrix> pAinv = GetSparseInverse(A, newSparsityPattern);
+
       Ainv = Utilities::GetThresholdedMatrix(pAinv, tol, fixing, pAinv->getGlobalMaxNumRowEntries());
       GetOStream(Statistics1) << "NNZ Ainv: " << pAinv->getGlobalNumEntries() << ", NNZ Tresholded Ainv (parameter: " << tol << "): " << Ainv->getGlobalNumEntries() << std::endl;
     }
@@ -142,6 +159,7 @@ namespace MueLu {
 
     Set(currentLevel, "Ainv", Ainv);
   }
+
 
   template <class Scalar, class LocalOrdinal, class GlobalOrdinal, class Node>
   RCP<Xpetra::Matrix<Scalar, LocalOrdinal, GlobalOrdinal, Node>>

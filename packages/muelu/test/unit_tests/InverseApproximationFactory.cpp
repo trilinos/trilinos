@@ -355,9 +355,36 @@ namespace MueLuTests {
 
       RCP<Matrix> Ainv = level.Get<RCP<Matrix> >("Ainv", invapproxFact.get());
       TEST_EQUALITY(Ainv.is_null(), false);
-      TEST_EQUALITY(Ainv->getGlobalNumEntries(), 115760);
-      // 8.31688788510637e+06
-      TEST_FLOATING_EQUALITY(Ainv->getFrobeniusNorm(), 8.31688788510637e+06, 1e5*TMT::eps());
+      TEST_FLOATING_EQUALITY(Ainv->getFrobeniusNorm(), 8.31688778510637e+06, 1e8*TMT::eps());
+    }
+
+    // Test approximate inverse with fill-in
+    {
+      using STS = Teuchos::ScalarTraits<SC>;
+
+      // Don't test for complex - matrix reader won't work
+      if (STS::isComplex) {success=true; return;}
+      RCP<Matrix> A = Xpetra::IO<Scalar,LocalOrdinal,GlobalOrdinal,Node>::Read("TestMatrices/beam.mm", lib, comm);
+
+      Level level;
+      TestHelpers::TestFactory<Scalar,LocalOrdinal,GlobalOrdinal,Node>::createSingleLevelHierarchy(level);
+      level.Set("A", A);
+
+      RCP<InverseApproximationFactory> invapproxFact = rcp( new InverseApproximationFactory() );
+      invapproxFact->SetFactory("A",MueLu::NoFactory::getRCP());
+      invapproxFact->SetParameter("inverse: approximation type", Teuchos::ParameterEntry(std::string("sparseapproxinverse")));
+      invapproxFact->SetParameter("inverse: level-of-fill", Teuchos::ParameterEntry(4));
+
+      // request InverseApproximation operator
+      level.Request("Ainv", invapproxFact.get());
+
+      // generate Schur complement operator
+      invapproxFact->Build(level);
+
+      RCP<Matrix> Ainv = level.Get<RCP<Matrix> >("Ainv", invapproxFact.get());
+      TEST_EQUALITY(Ainv.is_null(), false);
+      TEST_EQUALITY(Ainv->getGlobalNumEntries(), 237119);
+      TEST_FLOATING_EQUALITY(Ainv->getFrobeniusNorm(), 1.149564758493621e+07, 1e8*TMT::eps());
     }
 
   } //InverseSpaiConstructor

@@ -145,6 +145,8 @@ namespace MueLu {
 
       RCP<Level> l0 = H.GetLevel(0);
       RCP<Operator> Op = l0->Get<RCP<Operator>>("A");
+      H.SetProcRankVerbose(Op->getDomainMap()->getComm()->getRank());
+      VerboseObject::SetProcRankVerbose(Op->getDomainMap()->getComm()->getRank());
 
       // Compare nullspace dimension to NumPDEs and throw/warn based on user input
       if (l0->IsAvailable("Nullspace")) {

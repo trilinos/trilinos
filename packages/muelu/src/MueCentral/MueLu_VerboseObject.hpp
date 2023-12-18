@@ -133,9 +133,7 @@ namespace MueLu {
   private:
     //! Verbose level specific to 'this'
     VerbLevel verbLevel_;
-    mutable
-      int procRank_;
-    int numProcs_;
+    mutable int procRank_ = -1;
 
     static Teuchos::RCP<Teuchos::FancyOStream> mueluOutputStream_;
     static Teuchos::RCP<Teuchos::FancyOStream> blackHole_;

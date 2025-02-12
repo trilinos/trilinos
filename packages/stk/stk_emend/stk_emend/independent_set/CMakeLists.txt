@@ -50,12 +50,8 @@ SET(HEADERS "")
 FILE(GLOB HEADERS CONFIGURE_DEPENDS *.hpp)
 
 if(HAVE_STK_Trilinos)
-  TRIBITS_INCLUDE_DIRECTORIES(${${PACKAGE_NAME}_SOURCE_DIR})
+  TRIBITS_INCLUDE_DIRECTORIES(${${PARENT_PACKAGE_NAME}_SOURCE_DIR}/stk_emend)
 
-  TRIBITS_ADD_LIBRARY(
-    stk_emend
-    HEADERS ${HEADERS}
-    )
 else()
     add_library(stk_emend INTERFACE ${HEADERS})
     target_link_libraries(stk_emend INTERFACE stk_util_util)

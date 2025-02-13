@@ -24,6 +24,7 @@ namespace Ifpack2 {
       using impl_type = BlockHelperDetails::ImplType<MatrixType>;
       using local_ordinal_type_1d_view = typename impl_type::local_ordinal_type_1d_view;
       using size_type_1d_view = typename impl_type::size_type_1d_view;
+      using size_type_2d_lr_view = typename impl_type::size_type_2d_lr_view;
       using impl_scalar_type_1d_view_tpetra = Unmanaged<typename impl_type::impl_scalar_type_1d_view_tpetra>;
       // rowptr points to the start of each row of A_colindsub.
       size_type_1d_view rowptr, rowptr_remote;
@@ -34,6 +35,10 @@ namespace Ifpack2 {
       // seq_method_, then A_colindsub contains owned LIDs and A_colindsub_remote
       // contains the remote ones.
       local_ordinal_type_1d_view A_colindsub, A_colindsub_remote;
+      // Precomputed direct offsets to A blocks
+      i64_2d_view A_entry_offsets;
+      // Precomputed direct offsets to x blocks
+      i64_2d_view x_entry_offsets;
 
       // Currently always true.
       bool is_tpetra_block_crs;

@@ -2170,6 +2170,49 @@ namespace Ifpack2 {
           }
         }
 
+        /*
+          const size_type A_k0 = A_block_rowptr[lr];
+          Kokkos::parallel_for
+            (Kokkos::TeamThreadRange(member, rowptr_used[lr], rowptr_used[lr+1]),
+            [&](const size_type& k) {
+              const size_type j = A_k0 + colindsub_used[k];
+              const local_ordinal_type A_colind_at_j = A_colind[j];
+              // Pull x into local memory
+              if ((async && A_colind_at_j < num_local_rows) || (!async && !overlap)) {
+                const auto loc = is_dm2cm_active ? dm2cm[A_colind_at_j] : A_colind_at_j;
+                xx.assign_data( &x(loc*blocksize, col) );
+              } else {
+                const auto loc = A_colind_at_j - num_local_rows;
+                xx.assign_data( &x_remote(loc*blocksize, col) );
+              }
+
+              Kokkos::parallel_for(Kokkos::ThreadVectorRange(member, blocksize),[&](const local_ordinal_type & i){
+                local_x[i] = xx(i);
+              });
+        */
+
+        // Precompute offsets of each A and x entry to speed up residual.
+        // Reading A, x take up to 4, 6 levels of indirection respectively, but precomputing offsets reduces it to 2 for both.
+        // rowidx -> lr using lclrow
+        // lr+i -> k using rowptr_used
+        // k -> j using colindsub_used
+        // j -> A_colind_at_j using A_colind
+        // j -> A value using tpetra_values
+        // A_colind_at_j -> loc using dm2cm
+        // loc -> x value using x
+        //
+        // After, it is:
+        // rowidx, i -> Aoffset, xoffset using A_entry_offsets, x_entry_offsets
+        // Aoffset -> A value using tpetra_values
+        // xoffset -> x value using x
+        if(overlap_communication_and_computation || !is_async_importer_active) {
+          // Using OverlapTag (residual computed for owned and nonowned columns in separate kernel launches)
+
+        }
+        else {
+          // Using AsyncTag (residual computed for owned and nonwoned columns in one kernel)
+        }
+
         // Allocate view for E and initialize the values with B:
         
         if (interf.n_subparts_per_part > 1)
@@ -4998,6 +5041,7 @@ namespace Ifpack2 {
               // real use case does not use overlap comp and comm
               if (overlap_communication_and_computation || !is_async_importer_active) {
                 if (is_async_importer_active) async_importer->asyncSendRecv(YY);
+                // OverlapTag, compute_owned = true
                 compute_residual_vector.run(pmv, XX, YY, remote_multivector, true);
                 if (is_norm_manager_active && norm_manager.checkDone(sweep, tolerance)) {
                   if (is_async_importer_active) async_importer->cancel();
@@ -5005,12 +5049,14 @@ namespace Ifpack2 {
                 }
                 if (is_async_importer_active) {
                   async_importer->syncRecv();
+                  // OverlapTag, compute_owned = false
                   compute_residual_vector.run(pmv, XX, YY, remote_multivector, false);
                 }
               } else {
                 if (is_async_importer_active)
                   async_importer->syncExchange(YY);
                 if (is_norm_manager_active && norm_manager.checkDone(sweep, tolerance)) break;
+                // AsyncTag
                 compute_residual_vector.run(pmv, XX, YY, remote_multivector);
               }
             }

@@ -24,7 +24,7 @@ namespace Ifpack2 {
       using impl_type = BlockHelperDetails::ImplType<MatrixType>;
       using local_ordinal_type_1d_view = typename impl_type::local_ordinal_type_1d_view;
       using size_type_1d_view = typename impl_type::size_type_1d_view;
-      using size_type_2d_lr_view = typename impl_type::size_type_2d_lr_view;
+      using i64_2d_view  = typename impl_type::i64_2d_view;
       using impl_scalar_type_1d_view_tpetra = Unmanaged<typename impl_type::impl_scalar_type_1d_view_tpetra>;
       // rowptr points to the start of each row of A_colindsub.
       size_type_1d_view rowptr, rowptr_remote;
@@ -35,10 +35,12 @@ namespace Ifpack2 {
       // seq_method_, then A_colindsub contains owned LIDs and A_colindsub_remote
       // contains the remote ones.
       local_ordinal_type_1d_view A_colindsub, A_colindsub_remote;
-      // Precomputed direct offsets to A blocks
-      i64_2d_view A_entry_offsets;
-      // Precomputed direct offsets to x blocks
-      i64_2d_view x_entry_offsets;
+      // Precomputed direct offsets to A,x blocks, for owned entries (OverlapTag case) or all entries (AsyncTag case)
+      i64_2d_view A_offsets;
+      i64_2d_view x_offsets;
+      // Precomputed direct offsets to A,x blocks, for non-owned entries (OverlapTag case). For AsyncTag case this is left empty.
+      i64_2d_view A_offsets_remote;
+      i64_2d_view x_offsets_remote;
 
       // Currently always true.
       bool is_tpetra_block_crs;
@@ -114,6 +116,167 @@ namespace Ifpack2 {
       local_ordinal_type nparts;
     };
 
+    // Precompute offsets of each A and x entry to speed up residual.
+    // (Applies for hasBlockCrsMatrix == true and OverlapTag/AsyncTag)
+    // Reading A, x take up to 4, 6 levels of indirection respectively,
+    // but precomputing the offsets reduces it to 2 for both.
+    //
+    // This function allocates and populates these members of AmD:
+    // A_offsets, x_offsets, A_offsets_remote, x_offsets_remote
+    template<typename MatrixType>
+    void precompute_Ax_offsets(
+      AmD<MatrixType> &amd,
+      const PartInterface<MatrixType> &interf,
+      const Teuchos::RCP<const typename ImplType<MatrixType>::tpetra_crs_graph_type> &g,
+      const typename ImplType<MatrixType>::local_ordinal_type_1d_view &dm2cm,
+      int blocksize,
+      bool ownedRemoteSeparate)
+    {
+        using impl_type = ImplType<MatrixType>;
+        using i64_2d_view = typename impl_type::i64_2d_view;
+        using size_type = typename impl_type::size_type;
+        using local_ordinal_type = typename impl_type::local_ordinal_type;
+        using execution_space = typename impl_type::execution_space;
+        std::cout << "Hello from symbolic phase: precompuing offsets\n";
+        auto local_graph = g->getLocalGraphDevice();
+        const auto A_block_rowptr = local_graph.row_map;
+        const auto A_colind = local_graph.entries;
+        local_ordinal_type numLocalRows = interf.rowidx2part.extent(0);
+        int blocksize_square = blocksize * blocksize;
+        // shallow-copying views to avoid capturing the amd, interf objects in lambdas
+        auto lclrow = interf.lclrow;
+        auto A_colindsub = amd.A_colindsub;
+        auto A_colindsub_remote = amd.A_colindsub_remote;
+        auto rowptr = amd.rowptr;
+        auto rowptr_remote = amd.rowptr_remote;
+        bool is_dm2cm_active = dm2cm.extent(0);
+        std::cout << "ownedRemoteSeparate ? " << ownedRemoteSeparate << '\n';
+        std::cout << "is_dm2cm_active? " << is_dm2cm_active << '\n';
+        std::cout << "blocksize = " << blocksize << '\n';
+        std::cout << "numLocalRows = " << numLocalRows << '\n';
+        if(ownedRemoteSeparate) {
+          std::cout << "In overlap case - separate owned and remote\n";
+          // amd.rowptr points to owned entries only, and amd.rowptr_remote points to nonowned.
+          local_ordinal_type maxOwnedEntriesPerRow;
+          local_ordinal_type maxNonownedEntriesPerRow;
+          std::cout << "1\n";
+          Kokkos::parallel_reduce(Kokkos::RangePolicy<execution_space>(0, numLocalRows),
+            KOKKOS_LAMBDA(local_ordinal_type i, local_ordinal_type& lmaxOwned, local_ordinal_type& lmaxNonowned)
+            {
+              const local_ordinal_type lr = lclrow(i);
+              local_ordinal_type rowNumOwned = rowptr(lr+1) - rowptr(lr);
+              local_ordinal_type rowNumNonowned = rowptr_remote(lr+1) - rowptr_remote(lr);
+              if(rowNumOwned > lmaxOwned)
+                lmaxOwned = rowNumOwned;
+              if(rowNumNonowned > lmaxNonowned)
+                lmaxNonowned = rowNumNonowned;
+            }, Kokkos::Max<local_ordinal_type>(maxOwnedEntriesPerRow), Kokkos::Max<local_ordinal_type>(maxNonownedEntriesPerRow));
+          std::cout << "2\n";
+          // Allocate the four offsets views now that we know the dimensions
+          amd.A_offsets = i64_2d_view("amd.A_offsets", numLocalRows, maxOwnedEntriesPerRow);
+          amd.x_offsets = i64_2d_view("amd.x_offsets", numLocalRows, maxOwnedEntriesPerRow);
+          amd.A_offsets_remote = i64_2d_view("amd.A_offsets_remote", numLocalRows, maxNonownedEntriesPerRow);
+          amd.x_offsets_remote = i64_2d_view("amd.x_offsets_remote", numLocalRows, maxNonownedEntriesPerRow);
+          auto A_offsets = amd.A_offsets;
+          auto x_offsets = amd.x_offsets;
+          auto A_offsets_remote = amd.A_offsets_remote;
+          auto x_offsets_remote = amd.x_offsets_remote;
+          // Now, populate all the offsets. Use ArithTraits<int64_t>::min to say that no entry is not present.
+          Kokkos::parallel_for(Kokkos::RangePolicy<execution_space>(0, numLocalRows),
+            KOKKOS_LAMBDA(local_ordinal_type i)
+            {
+              const local_ordinal_type lr = lclrow(i);
+              const size_type A_k0 = A_block_rowptr(lr);
+              // Owned entries
+              size_type rowBegin = rowptr(lr);
+              local_ordinal_type rowNumOwned = rowptr(lr+1) - rowBegin;
+              for(local_ordinal_type entry = 0; entry < maxOwnedEntriesPerRow; entry++) {
+                if(entry < rowNumOwned) {
+                  const size_type j = A_k0 + A_colindsub(rowBegin + entry);
+                  const local_ordinal_type A_colind_at_j = A_colind(j);
+                  const auto loc = is_dm2cm_active ? dm2cm(A_colind_at_j) : A_colind_at_j;
+                  A_offsets(i, entry) = j * blocksize_square;
+                  x_offsets(i, entry) = loc * blocksize;
+                }
+                else {
+                  A_offsets(i, entry) = Kokkos::ArithTraits<int64_t>::min();
+                  x_offsets(i, entry) = Kokkos::ArithTraits<int64_t>::min();
+                }
+              }
+              // Nonowned entries
+              rowBegin = rowptr_remote(lr);
+              local_ordinal_type rowNumNonowned = rowptr_remote(lr+1) - rowBegin;
+              for(local_ordinal_type entry = 0; entry < maxNonownedEntriesPerRow; entry++) {
+                if(entry < rowNumNonowned) {
+                  const size_type j = A_k0 + A_colindsub_remote(rowBegin + entry);
+                  const local_ordinal_type A_colind_at_j = A_colind(j);
+                  const auto loc = A_colind_at_j - numLocalRows;
+                  A_offsets_remote(i, entry) = j * blocksize_square;
+                  x_offsets_remote(i, entry) = loc * blocksize;
+                }
+                else {
+                  A_offsets_remote(i, entry) = Kokkos::ArithTraits<int64_t>::min();
+                  x_offsets_remote(i, entry) = Kokkos::ArithTraits<int64_t>::min();
+                }
+              }
+            });
+          Kokkos::fence();
+          std::cout << "3\n";
+        }
+        else {
+          std::cout << "In non-overlap case - owned and remote in same rowptrs\n";
+          // amd.rowptr points to both owned and nonowned entries, so it tells us how many columns A_offsets,x_offsets should have.
+          local_ordinal_type maxEntriesPerRow;
+          std::cout << "4\n";
+          Kokkos::parallel_reduce(Kokkos::RangePolicy<execution_space>(0, numLocalRows),
+            KOKKOS_LAMBDA(local_ordinal_type i, local_ordinal_type& lmax)
+            {
+              const local_ordinal_type lr = lclrow(i);
+              local_ordinal_type rowNum = rowptr(lr+1) - rowptr(lr);
+              if(rowNum > lmax)
+                lmax = rowNum;
+            }, Kokkos::Max<local_ordinal_type>(maxEntriesPerRow));
+          Kokkos::fence();
+          std::cout << "4.5\n";
+          amd.A_offsets = i64_2d_view("amd.A_offsets", numLocalRows, maxEntriesPerRow);
+          amd.x_offsets = i64_2d_view("amd.x_offsets", numLocalRows, maxEntriesPerRow);
+          auto A_offsets = amd.A_offsets;
+          auto x_offsets = amd.x_offsets;
+          std::cout << "5\n";
+          //Populate A,x offsets. Use ArithTraits<int64_t>::min to say that no entry is not present.
+          //For x offsets, add a shift blocksize*numLocalRows to represent that it indexes into x_remote instead of x.
+          Kokkos::parallel_for(Kokkos::RangePolicy<execution_space>(0, numLocalRows),
+            KOKKOS_LAMBDA(local_ordinal_type i)
+            {
+              const local_ordinal_type lr = lclrow(i);
+              const size_type A_k0 = A_block_rowptr(lr);
+              // Owned entries
+              size_type rowBegin = rowptr(lr);
+              local_ordinal_type rowOwned = rowptr(lr+1) - rowBegin;
+              for(local_ordinal_type entry = 0; entry < maxEntriesPerRow; entry++) {
+                if(entry < rowOwned) {
+                  const size_type j = A_k0 + A_colindsub(rowBegin + entry);
+                  A_offsets(i, entry) = j * blocksize_square;
+                  const local_ordinal_type A_colind_at_j = A_colind(j);
+                  if(A_colind_at_j < numLocalRows) {
+                    const auto loc = is_dm2cm_active ? dm2cm[A_colind_at_j] : A_colind_at_j;
+                    x_offsets(i, entry) = loc * blocksize;
+                  }
+                  else {
+                    x_offsets(i, entry) = A_colind_at_j * blocksize;
+                  }
+                }
+                else {
+                  A_offsets(i, entry) = Kokkos::ArithTraits<int64_t>::min();
+                  x_offsets(i, entry) = Kokkos::ArithTraits<int64_t>::min();
+                }
+              }
+            });
+          Kokkos::fence();
+          std::cout << "6\n";
+        }
+    }
+
     ///
     /// compute local residula vector y = b - R x
     ///
@@ -187,6 +350,7 @@ namespace Ifpack2 {
       using impl_scalar_type_2d_view_tpetra = typename impl_type::impl_scalar_type_2d_view_tpetra; // block multivector (layout left)
       using vector_type_3d_view = typename impl_type::vector_type_3d_view;
       using btdm_scalar_type_4d_view = typename impl_type::btdm_scalar_type_4d_view;
+      using i64_2d_view  = typename impl_type::i64_2d_view;
       static constexpr int vector_length = impl_type::vector_length;
 
       /// team policy member type (used in cuda)
@@ -224,8 +388,31 @@ namespace Ifpack2 {
       const ConstUnmanaged<local_ordinal_type_1d_view> partptr;
       const ConstUnmanaged<local_ordinal_type_1d_view> lclrow;
       const ConstUnmanaged<local_ordinal_type_1d_view> dm2cm;
+
+      // block offsets
+      //const ConstUnmanaged<i64_2d_view> A_offsets;
+      //const ConstUnmanaged<i64_2d_view> A_offsets_remote;
+      //const ConstUnmanaged<i64_2d_view> x_offsets;
+      //const ConstUnmanaged<i64_2d_view> x_offsets_remote;
+      const i64_2d_view A_offsets;
+      const i64_2d_view A_offsets_remote;
+      const i64_2d_view x_offsets;
+      const i64_2d_view x_offsets_remote;
+
       const bool is_dm2cm_active;
       const bool hasBlockCrsMatrix;
+
+      /*
+      template<typename V>
+      void printView(V v) {
+        std::cout << "Dimensions: " << v.extent(0) << "x" << v.extent(1) << '\n';
+        std::cout <<" Values: ";
+        for(int i = 0; i < v.extent_int(0); i++)
+          for(int j = 0; j < v.extent_int(1); j++)
+            std::cout << v(i, j) << " ";
+        std::cout << '\n';
+      }
+      */
 
     public:
       template<typename LocalCrsGraphType>
@@ -234,7 +421,8 @@ namespace Ifpack2 {
                             const LocalCrsGraphType &point_graph,
                             const local_ordinal_type &blocksize_requested_,
                             const PartInterface<MatrixType> &interf,
-                            const local_ordinal_type_1d_view &dm2cm_)
+                            const local_ordinal_type_1d_view &dm2cm_,
+                            bool hasBlockCrsMatrix_)
         : rowptr(amd.rowptr), rowptr_remote(amd.rowptr_remote),
           colindsub(amd.A_colindsub), colindsub_remote(amd.A_colindsub_remote),
           tpetra_values(amd.tpetra_values),
@@ -248,9 +436,24 @@ namespace Ifpack2 {
           partptr(interf.partptr),
           lclrow(interf.lclrow),
           dm2cm(dm2cm_),
+          A_offsets(amd.A_offsets),
+          A_offsets_remote(amd.A_offsets_remote),
+          x_offsets(amd.x_offsets),
+          x_offsets_remote(amd.x_offsets_remote),
           is_dm2cm_active(dm2cm_.span() > 0),
-          hasBlockCrsMatrix(A_block_rowptr.extent(0) == A_point_rowptr.extent(0))
-      { }
+          hasBlockCrsMatrix(hasBlockCrsMatrix_)
+      {
+        /*
+        std::cout << "A offsets:\n";
+        printView(A_offsets);
+        std::cout << "A remote offsets:\n";
+        printView(A_offsets_remote);
+        std::cout << "x offsets:\n";
+        printView(x_offsets);
+        std::cout << "x remote offsets:\n";
+        printView(x_offsets_remote);
+        */
+      }
 
       inline
       void
@@ -511,15 +714,61 @@ namespace Ifpack2 {
             const size_type j = A_k0 + colindsub_used[k];
             const local_ordinal_type A_colind_at_j = A_colind[j];
             if constexpr (haveBlockMatrix) {
+              if(async) {
+                // Check that precomputed offset matches what we got here
+                size_type precomputed = A_offsets(rowidx, k - rowptr_used[lr]);
+                size_type actual = j * blocksize_square;
+                if(actual != precomputed)
+                  printf("Error async: A precomputed offset incorrect (%d vs %d)\n", (int) precomputed, (int) actual);
+              }
+              else {
+                if(overlap) {
+                  size_type precomputed = A_offsets_remote(rowidx, k - rowptr_used[lr]);
+                  size_type actual = j * blocksize_square;
+                  if(actual != precomputed)
+                    printf("Error overlap remote: A precomputed offset incorrect (%d vs %d)\n", (int) precomputed, (int) actual);
+                }
+                else {
+                  size_type precomputed = A_offsets(rowidx, k - rowptr_used[lr]);
+                  size_type actual = j * blocksize_square;
+                  if(actual != precomputed)
+                    printf("Error overlap owned: A precomputed offset incorrect (%d vs %d)\n", (int) precomputed, (int) actual);
+                }
+              }
+
               const impl_scalar_type * const AA = &tpetra_values(j*blocksize_square);
               if ((!async && !overlap) || (async && A_colind_at_j < num_local_rows)) {
                 const auto loc = is_dm2cm_active ? dm2cm[A_colind_at_j] : A_colind_at_j;
                 const impl_scalar_type * const xx = &x(loc*blocksize, col);
                 SerialGemv(blocksize, AA,xx,yy);
+
+                size_type actual = loc * blocksize;
+                if(async) {
+                  size_type precomputed = x_offsets(rowidx, k - rowptr_used[lr]);
+                  if(actual != precomputed)
+                    printf("Error async owned: x precomputed offset incorrect (%d vs %d)\n", (int) precomputed, (int) actual);
+                }
+                else {
+                  size_type precomputed = x_offsets(rowidx, k - rowptr_used[lr]);
+                  if(actual != precomputed)
+                    printf("Error overlap owned: x precomputed offset incorrect (%d vs %d)\n", (int) precomputed, (int) actual);
+                }
               } else {
                 const auto loc = A_colind_at_j - num_local_rows;
                 const impl_scalar_type * const xx_remote = &x_remote(loc*blocksize, col);
                 SerialGemv(blocksize, AA,xx_remote,yy);
+
+                size_type actual = loc * blocksize;
+                if(async) {
+                  size_type precomputed = x_offsets(rowidx, k - rowptr_used[lr]) - (blocksize * num_local_rows);
+                  if(actual != precomputed)
+                    printf("Error async remote: x precomputed offset incorrect (%d vs %d)\n", (int) precomputed, (int) actual);
+                }
+                else {
+                  size_type precomputed = x_offsets_remote(rowidx, k - rowptr_used[lr]);
+                  if(actual != precomputed)
+                    printf("Error overlap remote: x precomputed offset incorrect (%d vs %d)\n", (int) precomputed, (int) actual);
+                }
               }
             }
             else {

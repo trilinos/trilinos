@@ -1864,12 +1864,14 @@ namespace Ifpack2 {
                          const BlockHelperDetails::PartInterface<MatrixType> &interf,
                          BlockTridiags<MatrixType> &btdm,
                          BlockHelperDetails::AmD<MatrixType> &amd,
-                         const bool overlap_communication_and_computation) {
+                         const bool overlap_communication_and_computation,
+                         const Teuchos::RCP<AsyncableImport<MatrixType> > &async_importer,
+                         bool useSeqMethod) {
       IFPACK2_BLOCKHELPER_TIMER("BlockTriDi::SymbolicPhase", SymbolicPhase);
 
       using impl_type = BlockHelperDetails::ImplType<MatrixType>;
 
-      // using node_memory_space = typename impl_type::node_memory_space;
+      using execution_space = typename impl_type::execution_space;
       using host_execution_space = typename impl_type::host_execution_space;
 
       using local_ordinal_type = typename impl_type::local_ordinal_type;
@@ -2170,54 +2172,25 @@ namespace Ifpack2 {
           }
         }
 
-        /*
-          const size_type A_k0 = A_block_rowptr[lr];
-          Kokkos::parallel_for
-            (Kokkos::TeamThreadRange(member, rowptr_used[lr], rowptr_used[lr+1]),
-            [&](const size_type& k) {
-              const size_type j = A_k0 + colindsub_used[k];
-              const local_ordinal_type A_colind_at_j = A_colind[j];
-              // Pull x into local memory
-              if ((async && A_colind_at_j < num_local_rows) || (!async && !overlap)) {
-                const auto loc = is_dm2cm_active ? dm2cm[A_colind_at_j] : A_colind_at_j;
-                xx.assign_data( &x(loc*blocksize, col) );
-              } else {
-                const auto loc = A_colind_at_j - num_local_rows;
-                xx.assign_data( &x_remote(loc*blocksize, col) );
-              }
-
-              Kokkos::parallel_for(Kokkos::ThreadVectorRange(member, blocksize),[&](const local_ordinal_type & i){
-                local_x[i] = xx(i);
-              });
-        */
-
-        // Precompute offsets of each A and x entry to speed up residual.
-        // Reading A, x take up to 4, 6 levels of indirection respectively, but precomputing offsets reduces it to 2 for both.
-        // rowidx -> lr using lclrow
-        // lr+i -> k using rowptr_used
-        // k -> j using colindsub_used
-        // j -> A_colind_at_j using A_colind
-        // j -> A value using tpetra_values
-        // A_colind_at_j -> loc using dm2cm
-        // loc -> x value using x
-        //
-        // After, it is:
-        // rowidx, i -> Aoffset, xoffset using A_entry_offsets, x_entry_offsets
-        // Aoffset -> A value using tpetra_values
-        // xoffset -> x value using x
-        if(overlap_communication_and_computation || !is_async_importer_active) {
-          // Using OverlapTag (residual computed for owned and nonowned columns in separate kernel launches)
-
-        }
-        else {
-          // Using AsyncTag (residual computed for owned and nonwoned columns in one kernel)
-        }
-
         // Allocate view for E and initialize the values with B:
         
         if (interf.n_subparts_per_part > 1)
           btdm.e_values = vector_type_4d_view("btdm.e_values", 2, interf.part2packrowidx0_back, blocksize, blocksize);
       }
+      // Precompute offsets of each A and x entry to speed up residual.
+      // (Applies for hasBlockCrsMatrix == true and OverlapTag/AsyncTag)
+      // Reading A, x take up to 4, 6 levels of indirection respectively,
+      // but precomputing the offsets reduces it to 2 for both.
+      std::cout << "useSeqMethod ? " << useSeqMethod << '\n';
+      std::cout << "hasBlock? " << hasBlockCrsMatrix << '\n';
+      if(!useSeqMethod && hasBlockCrsMatrix)
+      {
+        bool is_async_importer_active = !async_importer.is_null();
+        local_ordinal_type_1d_view dm2cm = is_async_importer_active ? async_importer->dm2cm : local_ordinal_type_1d_view();
+        bool ownedRemoteSeparate = overlap_communication_and_computation || !is_async_importer_active;
+        BlockHelperDetails::precompute_Ax_offsets<MatrixType>(amd, interf, g, dm2cm, blocksize, ownedRemoteSeparate);
+      }
+
       IFPACK2_BLOCKHELPER_TIMER_FENCE(typename BlockHelperDetails::ImplType<MatrixType>::execution_space)
     }
 
@@ -5013,7 +4986,8 @@ namespace Ifpack2 {
 
       BlockHelperDetails::ComputeResidualVector<MatrixType>
         compute_residual_vector(amd, G->getLocalGraphDevice(), g.getLocalGraphDevice(), blocksize, interf,
-                                is_async_importer_active ? async_importer->dm2cm : dummy_local_ordinal_type_1d_view);
+                                is_async_importer_active ? async_importer->dm2cm : dummy_local_ordinal_type_1d_view,
+                                hasBlockCrsMatrix);
 
       // norm manager workspace resize
       if (is_norm_manager_active)

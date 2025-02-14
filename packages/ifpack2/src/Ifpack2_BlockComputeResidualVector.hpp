@@ -402,18 +402,6 @@ namespace Ifpack2 {
       const bool is_dm2cm_active;
       const bool hasBlockCrsMatrix;
 
-      /*
-      template<typename V>
-      void printView(V v) {
-        std::cout << "Dimensions: " << v.extent(0) << "x" << v.extent(1) << '\n';
-        std::cout <<" Values: ";
-        for(int i = 0; i < v.extent_int(0); i++)
-          for(int j = 0; j < v.extent_int(1); j++)
-            std::cout << v(i, j) << " ";
-        std::cout << '\n';
-      }
-      */
-
     public:
       template<typename LocalCrsGraphType>
       ComputeResidualVector(const AmD<MatrixType> &amd,
@@ -442,18 +430,7 @@ namespace Ifpack2 {
           x_offsets_remote(amd.x_offsets_remote),
           is_dm2cm_active(dm2cm_.span() > 0),
           hasBlockCrsMatrix(hasBlockCrsMatrix_)
-      {
-        /*
-        std::cout << "A offsets:\n";
-        printView(A_offsets);
-        std::cout << "A remote offsets:\n";
-        printView(A_offsets_remote);
-        std::cout << "x offsets:\n";
-        printView(x_offsets);
-        std::cout << "x remote offsets:\n";
-        printView(x_offsets_remote);
-        */
-      }
+      {}
 
       inline
       void
@@ -714,6 +691,7 @@ namespace Ifpack2 {
             const size_type j = A_k0 + colindsub_used[k];
             const local_ordinal_type A_colind_at_j = A_colind[j];
             if constexpr (haveBlockMatrix) {
+              /*
               if(async) {
                 // Check that precomputed offset matches what we got here
                 size_type precomputed = A_offsets(rowidx, k - rowptr_used[lr]);
@@ -735,6 +713,7 @@ namespace Ifpack2 {
                     printf("Error overlap owned: A precomputed offset incorrect (%d vs %d)\n", (int) precomputed, (int) actual);
                 }
               }
+              */
 
               const impl_scalar_type * const AA = &tpetra_values(j*blocksize_square);
               if ((!async && !overlap) || (async && A_colind_at_j < num_local_rows)) {
@@ -743,6 +722,7 @@ namespace Ifpack2 {
                 SerialGemv(blocksize, AA,xx,yy);
 
                 size_type actual = loc * blocksize;
+                /*
                 if(async) {
                   size_type precomputed = x_offsets(rowidx, k - rowptr_used[lr]);
                   if(actual != precomputed)
@@ -753,12 +733,14 @@ namespace Ifpack2 {
                   if(actual != precomputed)
                     printf("Error overlap owned: x precomputed offset incorrect (%d vs %d)\n", (int) precomputed, (int) actual);
                 }
+                */
               } else {
                 const auto loc = A_colind_at_j - num_local_rows;
                 const impl_scalar_type * const xx_remote = &x_remote(loc*blocksize, col);
                 SerialGemv(blocksize, AA,xx_remote,yy);
 
                 size_type actual = loc * blocksize;
+                /*
                 if(async) {
                   size_type precomputed = x_offsets(rowidx, k - rowptr_used[lr]) - (blocksize * num_local_rows);
                   if(actual != precomputed)
@@ -769,6 +751,7 @@ namespace Ifpack2 {
                   if(actual != precomputed)
                     printf("Error overlap remote: x precomputed offset incorrect (%d vs %d)\n", (int) precomputed, (int) actual);
                 }
+                */
               }
             }
             else {
@@ -822,8 +805,6 @@ namespace Ifpack2 {
         subview_1D_right_t xx(nullptr, blocksize);
         subview_1D_stride_t yy(nullptr, Kokkos::LayoutStride(blocksize, y_packed_scalar.stride_1()));
         auto A_block_cst = ConstUnmanaged<tpetra_block_access_view_type>(NULL, blocksize, blocksize);
-        auto colindsub_used = overlap ? colindsub_remote : colindsub;
-        auto rowptr_used = overlap ? rowptr_remote : rowptr;
 
         // Get shared allocation for a local copy of x, Ax, and A
         impl_scalar_type * local_Ax = reinterpret_cast<impl_scalar_type *>(member.team_scratch(0).get_shmem(blocksize*sizeof(impl_scalar_type)));
@@ -841,35 +822,52 @@ namespace Ifpack2 {
           });
           member.team_barrier();
 
-          const size_type A_k0 = A_block_rowptr[lr];
-          Kokkos::parallel_for
-            (Kokkos::TeamThreadRange(member, rowptr_used[lr], rowptr_used[lr+1]),
-            [&](const size_type& k) {
-              const size_type j = A_k0 + colindsub_used[k];
-              const local_ordinal_type A_colind_at_j = A_colind[j];
-              // Pull x into local memory
-              if ((async && A_colind_at_j < num_local_rows) || (!async && !overlap)) {
-                const auto loc = is_dm2cm_active ? dm2cm[A_colind_at_j] : A_colind_at_j;
-                xx.assign_data( &x(loc*blocksize, col) );
-              } else {
-                const auto loc = A_colind_at_j - num_local_rows;
-                xx.assign_data( &x_remote(loc*blocksize, col) );
-              }
+          int numEntries;
+          if constexpr(!overlap) {
+            numEntries = A_offsets.extent(1);
+          }
+          else {
+            numEntries = A_offsets_remote.extent(1);
+          }
 
-              Kokkos::parallel_for(Kokkos::ThreadVectorRange(member, blocksize),[&](const local_ordinal_type & i){
-                local_x[i] = xx(i);
-              });
-            
-              // MatVec op Ax += A*x
-              A_block_cst.assign_data( &tpetra_values(j*blocksize_square) );
-              Kokkos::parallel_for(
-                Kokkos::ThreadVectorRange(member, blocksize),
-                [&](const local_ordinal_type &k0) {
-                  impl_scalar_type val = 0;
-                  for(int k1=0; k1<blocksize; k1++)
-                    val += A_block_cst(k0,k1)*local_x[k1];
-                  Kokkos::atomic_add(local_Ax+k0, val);
-              });
+          Kokkos::parallel_for
+            (Kokkos::TeamThreadRange(member, 0, numEntries),
+            [&](const int k) {
+              int64_t A_offset = overlap ? A_offsets_remote(rowidx, k) : A_offsets(rowidx, k);
+              if(A_offset != Kokkos::ArithTraits<int64_t>::min()) {
+                A_block_cst.assign_data(tpetra_values.data() + A_offset);
+                // Pull x into local memory
+                if constexpr(async) {
+                  int64_t x_offset = x_offsets(rowidx, k);
+                  size_type remote_cutoff = blocksize * num_local_rows;
+                  if(x_offset >= remote_cutoff)
+                    xx.assign_data(&x_remote(x_offset - remote_cutoff, col));
+                  else
+                    xx.assign_data(&x(x_offset, col));
+                }
+                else {
+                  if constexpr(!overlap) {
+                    xx.assign_data(&x(x_offsets(rowidx, k), col));
+                  }
+                  else {
+                    xx.assign_data(&x_remote(x_offsets(rowidx, k), col));
+                  }
+                }
+
+                Kokkos::parallel_for(Kokkos::ThreadVectorRange(member, blocksize),[&](const local_ordinal_type & i){
+                  local_x[i] = xx(i);
+                });
+              
+                // MatVec op Ax += A*x
+                Kokkos::parallel_for(
+                  Kokkos::ThreadVectorRange(member, blocksize),
+                  [&](const local_ordinal_type &k0) {
+                    impl_scalar_type val = 0;
+                    for(int k1=0; k1<blocksize; k1++)
+                      val += A_block_cst(k0,k1)*local_x[k1];
+                    Kokkos::atomic_add(local_Ax+k0, val);
+                });
+              }
             });
           member.team_barrier();
           // Update y = b - local_Ax

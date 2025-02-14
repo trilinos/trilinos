@@ -2183,7 +2183,7 @@ namespace Ifpack2 {
       // but precomputing the offsets reduces it to 2 for both.
       std::cout << "useSeqMethod ? " << useSeqMethod << '\n';
       std::cout << "hasBlock? " << hasBlockCrsMatrix << '\n';
-      if(!useSeqMethod && hasBlockCrsMatrix)
+      if(BlockHelperDetails::is_device<execution_space>::value && !useSeqMethod && hasBlockCrsMatrix)
       {
         bool is_async_importer_active = !async_importer.is_null();
         local_ordinal_type_1d_view dm2cm = is_async_importer_active ? async_importer->dm2cm : local_ordinal_type_1d_view();
